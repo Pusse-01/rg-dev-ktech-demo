@@ -1,11 +1,16 @@
 """
 Synacal Manufacturing Cost Estimator
-Conversational AI estimator using Azure AI Foundry (agent protocol) + Streamlit
+Conversational AI estimator using Azure AI Foundry + Streamlit
 """
 import os
 import re
 import time
+import warnings
 from datetime import datetime
+
+# Suppress openai v2.x deprecation noise for Assistants API (still fully functional)
+warnings.filterwarnings("ignore", message=".*Assistants API.*deprecated.*", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*deprecated.*", category=DeprecationWarning)
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -77,9 +82,8 @@ for _k, _v in {
 }.items():
     st.session_state.setdefault(_k, _v)
 
-# ── Auth helper ────────────────────────────────────────────────────────────────
+# ── Auth helper (wraps API key as TokenCredential for AIProjectClient) ─────────
 class _BearerKey:
-    """Wrap a project API key as a TokenCredential so AIProjectClient accepts it."""
     def __init__(self, key: str):
         self._key = key
 
@@ -89,63 +93,81 @@ class _BearerKey:
 
 
 # ── Client factory ─────────────────────────────────────────────────────────────
-def _normalise_endpoint(ep: str) -> str:
-    """Ensure the endpoint has the /api/projects/_project suffix if needed."""
-    ep = ep.rstrip("/")
-    if ep.endswith(".services.ai.azure.com"):
-        ep += "/api/projects/_project"
-    return ep
-
-
-def _make_oai_client(endpoint: str, api_key: str, agent_name: str):
+def _build_openai_client(endpoint: str, api_key: str):
     """
-    Return an openai.OpenAI client pointed at the Foundry agent's OpenAI-compatible
-    protocol endpoint.  No actual API calls are made until the first query.
-    """
-    from azure.ai.projects import AIProjectClient  # local import keeps startup fast
+    Build the correct OpenAI client based on endpoint type.
 
-    full_ep = _normalise_endpoint(endpoint)
-    project = AIProjectClient(
-        endpoint=full_ep,
-        credential=_BearerKey(api_key),
-        allow_preview=True,
-    )
-    # Override api_key so the returned OpenAI client uses Bearer auth with the API key
-    oai = project.get_openai_client(agent_name=agent_name, api_key=api_key)
-    return oai
+    - If the endpoint contains '.openai.azure.com' → use openai.AzureOpenAI
+      (standard Azure OpenAI Assistants API, api-version in query string)
+    - Otherwise treat as an Azure AI Foundry project endpoint → use
+      AIProjectClient.get_openai_client() which points at {endpoint}/openai/v1
+      using Bearer-token (project API key) auth.
+
+    Returns a ready openai client. No API calls made at construction time.
+    """
+    ep = endpoint.rstrip("/")
+
+    if "openai.azure.com" in ep:
+        # ── Azure OpenAI classic endpoint ──────────────────────────────────
+        from openai import AzureOpenAI
+        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
+        return AzureOpenAI(azure_endpoint=ep, api_key=api_key, api_version=api_version)
+
+    else:
+        # ── Azure AI Foundry project endpoint ──────────────────────────────
+        # Normalise: add /api/projects/_project when only the base domain is given
+        if "/api/projects/" not in ep:
+            ep += "/api/projects/_project"
+
+        from azure.ai.projects import AIProjectClient
+        project = AIProjectClient(
+            endpoint=ep,
+            credential=_BearerKey(api_key),
+            allow_preview=False,
+        )
+        # get_openai_client() WITHOUT agent_name → base_url = {endpoint}/openai/v1
+        # Passing api_key overrides the bearer-token-provider so the plain API key
+        # is sent in the Authorization header.
+        return project.get_openai_client(api_key=api_key)
 
 
 def _resolve_agent_id(oai_client, agent_name: str) -> str:
-    """Try to find the assistant ID by listing assistants; fall back to agent name."""
+    """
+    Resolve a human-readable agent name to the underlying assistant ID.
+    If the name already looks like an ID (starts with 'asst_') return it as-is.
+    Falls back to the name itself when listing fails (Foundry routes by endpoint).
+    """
+    if agent_name.startswith("asst_"):
+        return agent_name
     try:
-        for page in oai_client.beta.assistants.list(limit=100):
-            # page may be a SyncPage or list depending on SDK version
-            items = page if isinstance(page, list) else getattr(page, "data", [page])
-            for a in items:
-                if getattr(a, "name", None) == agent_name:
-                    return a.id
+        # openai v2.x returns an iterable of Assistant objects directly
+        page = oai_client.beta.assistants.list(limit=100)
+        items = getattr(page, "data", list(page))
+        for a in items:
+            if getattr(a, "name", None) == agent_name:
+                return a.id
     except Exception:
         pass
-    return agent_name  # Foundry routes by endpoint; name often works too
+    return agent_name
 
 
 # ── Formatting guide appended to every user message ───────────────────────────
 _GUIDE = (
     "\n\n---\n"
-    "RESPONSE FORMAT (use when giving estimates):\n\n"
-    "- **Timeline**: [X weeks with phase details]\n"
+    "RESPONSE FORMAT — use these exact section headers when providing estimates:\n\n"
+    "- **Timeline**: [X weeks with brief phase breakdown]\n"
     "- **Material Cost**: USD [amount]  *(raw materials & finishes)*\n"
     "- **Labor Cost**: USD [amount]  *(fabrication & installation)*\n"
     "- **Total Estimate**: USD [amount]\n"
-    "- **Reference Projects**: [Project codes e.g. RJ979, RJ908 from the knowledge base]\n\n"
-    "Even when original data has a single cost figure, split it into Material/Labor "
+    "- **Reference Projects**: [list project codes from the knowledge base, e.g. RJ979, RJ908]\n\n"
+    "If the original project data shows a single cost, split it into Material/Labor "
     "using typical industry ratios for the product type.\n"
     "---"
 )
 
 
 def _run_query(oai, agent_id: str, user_text: str, thread_id: str | None) -> tuple[str, str]:
-    """Send a message, run the agent, return (response_text, thread_id)."""
+    """Send a user message, run the agent, return (response_text, thread_id)."""
     if thread_id is None:
         thread_id = oai.beta.threads.create().id
 
@@ -169,10 +191,11 @@ def _run_query(oai, agent_id: str, user_text: str, thread_id: str | None) -> tup
 
     for m in msg_list:
         if m.role == "assistant":
-            parts = []
-            for c in m.content:
-                if hasattr(c, "text") and hasattr(c.text, "value"):
-                    parts.append(c.text.value)
+            parts = [
+                c.text.value
+                for c in m.content
+                if hasattr(c, "text") and hasattr(c.text, "value")
+            ]
             return "\n\n".join(parts) or "No response text.", thread_id
 
     return "The agent returned no response.", thread_id
@@ -262,19 +285,18 @@ def _ensure_ready():
     agent_id = st.session_state["_agent_id"]
 
     if oai is None:
-        ep = os.getenv("AZURE_AI_ENDPOINT", "")
+        ep  = os.getenv("AZURE_AI_ENDPOINT", "")
         key = os.getenv("AZURE_API_KEY", "")
         name = os.getenv("AZURE_AGENT_NAME", os.getenv("AZURE_AGENT_ID", "dev-ktech-demo"))
-        if ep and key and name:
+        if ep and key:
             try:
-                oai = _make_oai_client(ep, key, name)
-                st.session_state["_oai"] = oai
-                st.session_state["_agent_name"] = name
+                oai = _build_openai_client(ep, key)
+                st.session_state.update({"_oai": oai, "_agent_name": name})
             except Exception:
                 return None, None
 
     if agent_id is None and oai is not None:
-        name = st.session_state.get("_agent_name", os.getenv("AZURE_AGENT_NAME", "dev-ktech-demo"))
+        name = st.session_state.get("_agent_name", "dev-ktech-demo")
         agent_id = _resolve_agent_id(oai, name)
         st.session_state["_agent_id"] = agent_id
 
@@ -288,30 +310,34 @@ with st.sidebar:
 
     _cfg_open = not bool(os.getenv("AZURE_API_KEY") and os.getenv("AZURE_AI_ENDPOINT"))
     with st.expander("🔑 Azure Configuration", expanded=_cfg_open):
+        st.caption(
+            "Provide **either** your Azure AI Foundry project endpoint "
+            "*(…services.ai.azure.com/api/projects/…)* "
+            "**or** your Azure OpenAI endpoint *(…openai.azure.com)*."
+        )
         _ep = st.text_input(
-            "Project Endpoint",
+            "Endpoint",
             value=os.getenv("AZURE_AI_ENDPOINT", ""),
             placeholder="https://xxx.services.ai.azure.com/api/projects/_project",
-            help="From AI Foundry Home → Project endpoint. Append /api/projects/_project if not already present.",
         )
         _key = st.text_input(
             "API Key",
             value=os.getenv("AZURE_API_KEY", ""),
             type="password",
-            help="From AI Foundry Home → API key",
+            help="Project API key (AI Foundry Home) or Azure OpenAI key (Models page)",
         )
         _agent = st.text_input(
-            "Agent Name",
+            "Agent Name or ID",
             value=os.getenv("AZURE_AGENT_NAME", os.getenv("AZURE_AGENT_ID", "dev-ktech-demo")),
-            help="Name shown in AI Foundry → Build → Agents",
+            help="Agent name from AI Foundry → Build → Agents, or paste the full assistant ID (asst_xxx)",
         )
         if st.button("🔗 Connect", type="primary", use_container_width=True):
             with st.spinner("Connecting…"):
                 try:
-                    _oai = _make_oai_client(_ep, _key, _agent)
+                    _oai = _build_openai_client(_ep, _key)
                     _aid = _resolve_agent_id(_oai, _agent)
                     st.session_state.update({"_oai": _oai, "_agent_id": _aid, "_agent_name": _agent})
-                    st.success(f"Connected to **{_agent}**")
+                    st.success(f"Connected!  Agent resolved to `{_aid[:24]}…`")
                 except Exception as exc:
                     st.error(f"Connection failed: {exc}")
 
