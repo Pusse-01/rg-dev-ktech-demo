@@ -196,7 +196,7 @@ def _build_client(endpoint: str, api_key: str):
             ep += "/api/projects/_project"
         base_url = ep + "/openai/v1/"
 
-    return OpenAI(api_key=api_key, base_url=base_url)
+    return OpenAI(api_key=api_key, base_url=base_url, default_query={"api-version": "2025-11-15-preview"})
 
 
 # ── Formatting guide ───────────────────────────────────────────────────────────
