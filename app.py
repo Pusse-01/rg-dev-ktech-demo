@@ -1,16 +1,14 @@
 """
 Synacal Manufacturing Cost Estimator
-Conversational AI estimator using Azure AI Foundry + Streamlit
+Conversational AI estimator using Azure AI Foundry Responses API + Streamlit
 """
 import os
 import re
-import time
 import warnings
 from datetime import datetime
 
-# Suppress openai v2.x deprecation noise for Assistants API (still fully functional)
-warnings.filterwarnings("ignore", message=".*Assistants API.*deprecated.*", category=DeprecationWarning)
-warnings.filterwarnings("ignore", message=".*deprecated.*", category=DeprecationWarning)
+# Suppress openai v2.x deprecation noise (Responses API is the preferred API anyway)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -76,129 +74,106 @@ st.markdown(
 # ── Session state ──────────────────────────────────────────────────────────────
 for _k, _v in {
     "messages": [],
-    "thread_id": None,
-    "_oai": None,          # openai.OpenAI client for the agent
-    "_agent_id": None,     # resolved assistant/agent ID for runs
+    "prev_response_id": None,   # chains Responses API turns together
+    "_client": None,
+    "_agent_name": None,
 }.items():
     st.session_state.setdefault(_k, _v)
 
-# ── Auth helper (wraps API key as TokenCredential for AIProjectClient) ─────────
-class _BearerKey:
-    def __init__(self, key: str):
-        self._key = key
 
-    def get_token(self, *_scopes, **_kw):
-        from azure.core.credentials import AccessToken
-        return AccessToken(self._key, int(time.time()) + 86400)
-
-
-# ── Client factory ─────────────────────────────────────────────────────────────
-def _build_openai_client(endpoint: str, api_key: str):
+# ── Client factory (Responses API) ────────────────────────────────────────────
+def _build_client(endpoint: str, api_key: str):
     """
-    Build the correct OpenAI client based on endpoint type.
+    Return an OpenAI client configured for the Azure AI Foundry Responses API.
 
-    - If the endpoint contains '.openai.azure.com' → use openai.AzureOpenAI
-      (standard Azure OpenAI Assistants API, api-version in query string)
-    - Otherwise treat as an Azure AI Foundry project endpoint → use
-      AIProjectClient.get_openai_client() which points at {endpoint}/openai/v1
-      using Bearer-token (project API key) auth.
+    Accepted endpoint formats
+    ─────────────────────────
+    A) "Endpoint (Responses)" copied directly from the agent Playground panel:
+       https://resource.services.ai.azure.com/api/projects/name/openai/v1/responses
+       → strips /responses, uses remainder as base_url
 
-    Returns a ready openai client. No API calls made at construction time.
+    B) Full OpenAI v1 path (no /responses suffix):
+       https://resource.services.ai.azure.com/api/projects/name/openai/v1
+
+    C) Project endpoint (shorter form):
+       https://resource.services.ai.azure.com/api/projects/name
+       https://resource.services.ai.azure.com   (appends /api/projects/_project)
+
+    D) Classic Azure OpenAI endpoint:
+       https://resource.openai.azure.com
     """
     ep = endpoint.rstrip("/")
 
     if "openai.azure.com" in ep:
-        # ── Azure OpenAI classic endpoint ──────────────────────────────────
+        # ── Classic Azure OpenAI endpoint ──────────────────────────────────
         from openai import AzureOpenAI
-        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
-        return AzureOpenAI(azure_endpoint=ep, api_key=api_key, api_version=api_version)
+        return AzureOpenAI(azure_endpoint=ep, api_key=api_key, api_version="v1")
 
+    # ── Azure AI Foundry / AI Services endpoint ────────────────────────────
+    from openai import AzureOpenAI
+
+    # Normalise to the project path if only the base domain was given
+    if "services.ai.azure.com" in ep and "/api/projects/" not in ep:
+        ep += "/api/projects/_project"
+
+    # Strip /responses suffix to get the base OpenAI v1 URL
+    if ep.endswith("/responses"):
+        ep = ep[: -len("/responses")]
+
+    # ep should now end with .../openai/v1  OR  .../api/projects/name
+    # AzureOpenAI needs the endpoint BEFORE /openai; trim /openai/v1 if present
+    if ep.endswith("/openai/v1"):
+        azure_ep = ep[: -len("/openai/v1")]
+    elif ep.endswith("/openai"):
+        azure_ep = ep[: -len("/openai")]
     else:
-        # ── Azure AI Foundry project endpoint ──────────────────────────────
-        # Normalise: add /api/projects/_project when only the base domain is given
-        if "/api/projects/" not in ep:
-            ep += "/api/projects/_project"
+        azure_ep = ep
 
-        from azure.ai.projects import AIProjectClient
-        project = AIProjectClient(
-            endpoint=ep,
-            credential=_BearerKey(api_key),
-            allow_preview=False,
-        )
-        # get_openai_client() WITHOUT agent_name → base_url = {endpoint}/openai/v1
-        # Passing api_key overrides the bearer-token-provider so the plain API key
-        # is sent in the Authorization header.
-        return project.get_openai_client(api_key=api_key)
+    return AzureOpenAI(azure_endpoint=azure_ep, api_key=api_key, api_version="v1")
 
 
-def _resolve_agent_id(oai_client, agent_name: str) -> str:
-    """
-    Resolve a human-readable agent name to the underlying assistant ID.
-    If the name already looks like an ID (starts with 'asst_') return it as-is.
-    Falls back to the name itself when listing fails (Foundry routes by endpoint).
-    """
-    if agent_name.startswith("asst_"):
-        return agent_name
-    try:
-        # openai v2.x returns an iterable of Assistant objects directly
-        page = oai_client.beta.assistants.list(limit=100)
-        items = getattr(page, "data", list(page))
-        for a in items:
-            if getattr(a, "name", None) == agent_name:
-                return a.id
-    except Exception:
-        pass
-    return agent_name
-
-
-# ── Formatting guide appended to every user message ───────────────────────────
+# ── Formatting guide appended to user messages ────────────────────────────────
 _GUIDE = (
     "\n\n---\n"
-    "RESPONSE FORMAT — use these exact section headers when providing estimates:\n\n"
+    "RESPONSE FORMAT — always use these exact section headers for estimates:\n\n"
     "- **Timeline**: [X weeks with brief phase breakdown]\n"
     "- **Material Cost**: USD [amount]  *(raw materials & finishes)*\n"
     "- **Labor Cost**: USD [amount]  *(fabrication & installation)*\n"
     "- **Total Estimate**: USD [amount]\n"
     "- **Reference Projects**: [list project codes from the knowledge base, e.g. RJ979, RJ908]\n\n"
-    "If the original project data shows a single cost, split it into Material/Labor "
-    "using typical industry ratios for the product type.\n"
+    "If original data shows one combined cost, split it using typical industry ratios.\n"
     "---"
 )
 
 
-def _run_query(oai, agent_id: str, user_text: str, thread_id: str | None) -> tuple[str, str]:
-    """Send a user message, run the agent, return (response_text, thread_id)."""
-    if thread_id is None:
-        thread_id = oai.beta.threads.create().id
-
-    oai.beta.threads.messages.create(
-        thread_id=thread_id,
-        role="user",
-        content=user_text + _GUIDE,
+def _run_query(
+    client,
+    agent_name: str,
+    user_text: str,
+    prev_response_id: str | None,
+) -> tuple[str, str]:
+    """
+    Call the Azure AI Foundry Responses API.
+    Returns (response_text, new_response_id).
+    Chains turns via previous_response_id for full conversation context.
+    """
+    kwargs: dict = dict(
+        model=agent_name,
+        input=[{"role": "user", "content": user_text + _GUIDE}],
     )
+    if prev_response_id:
+        kwargs["previous_response_id"] = prev_response_id
 
-    run = oai.beta.threads.runs.create_and_poll(
-        thread_id=thread_id,
-        assistant_id=agent_id,
-    )
+    response = client.responses.create(**kwargs)
 
-    if run.status == "failed":
-        err = getattr(run, "last_error", "unknown error")
-        raise RuntimeError(f"Agent run failed: {err}")
+    # Extract text — output_text is the convenience attribute in openai v2.x
+    text: str = getattr(response, "output_text", "") or ""
+    if not text:
+        for item in getattr(response, "output", []):
+            for c in getattr(item, "content", []):
+                text += getattr(c, "text", "")
 
-    msgs = oai.beta.threads.messages.list(thread_id=thread_id)
-    msg_list = getattr(msgs, "data", list(msgs))
-
-    for m in msg_list:
-        if m.role == "assistant":
-            parts = [
-                c.text.value
-                for c in m.content
-                if hasattr(c, "text") and hasattr(c.text, "value")
-            ]
-            return "\n\n".join(parts) or "No response text.", thread_id
-
-    return "The agent returned no response.", thread_id
+    return text.strip() or "No response received.", response.id
 
 
 # ── Response parsing ───────────────────────────────────────────────────────────
@@ -271,36 +246,32 @@ def _render_card(p: dict):
     if p["references"]:
         badges = "".join(f'<span class="ref-badge">📁 {r}</span>' for r in p["references"])
         st.markdown(
-            f'<div class="ref-section"><div class="ref-label">📚 Reference Evidence from Knowledge Base</div>'
+            f'<div class="ref-section">'
+            f'<div class="ref-label">📚 Reference Evidence from Knowledge Base</div>'
             f'<div>{badges}</div></div>',
             unsafe_allow_html=True,
         )
-
     st.divider()
 
 
 # ── Auto-connect from env ──────────────────────────────────────────────────────
 def _ensure_ready():
-    oai = st.session_state["_oai"]
-    agent_id = st.session_state["_agent_id"]
+    client = st.session_state["_client"]
+    agent  = st.session_state["_agent_name"]
 
-    if oai is None:
-        ep  = os.getenv("AZURE_AI_ENDPOINT", "")
-        key = os.getenv("AZURE_API_KEY", "")
-        name = os.getenv("AZURE_AGENT_NAME", os.getenv("AZURE_AGENT_ID", "dev-ktech-demo"))
+    if client is None:
+        ep   = os.getenv("AZURE_AI_ENDPOINT", "")
+        key  = os.getenv("AZURE_API_KEY", "")
+        name = os.getenv("AZURE_AGENT_NAME", "dev-ktech-demo")
         if ep and key:
             try:
-                oai = _build_openai_client(ep, key)
-                st.session_state.update({"_oai": oai, "_agent_name": name})
+                client = _build_client(ep, key)
+                st.session_state.update({"_client": client, "_agent_name": name})
+                agent = name
             except Exception:
                 return None, None
 
-    if agent_id is None and oai is not None:
-        name = st.session_state.get("_agent_name", "dev-ktech-demo")
-        agent_id = _resolve_agent_id(oai, name)
-        st.session_state["_agent_id"] = agent_id
-
-    return oai, agent_id
+    return client, agent
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -311,39 +282,39 @@ with st.sidebar:
     _cfg_open = not bool(os.getenv("AZURE_API_KEY") and os.getenv("AZURE_AI_ENDPOINT"))
     with st.expander("🔑 Azure Configuration", expanded=_cfg_open):
         st.caption(
-            "Provide **either** your Azure AI Foundry project endpoint "
-            "*(…services.ai.azure.com/api/projects/…)* "
-            "**or** your Azure OpenAI endpoint *(…openai.azure.com)*."
+            "Paste the **Endpoint (Responses)** URL from your agent's "
+            "Playground → *(three-dot menu / Publish panel)*"
         )
         _ep = st.text_input(
-            "Endpoint",
+            "Endpoint (Responses)",
             value=os.getenv("AZURE_AI_ENDPOINT", ""),
-            placeholder="https://xxx.services.ai.azure.com/api/projects/_project",
+            placeholder="https://resource.services.ai.azure.com/api/projects/name/openai/v1/responses",
         )
         _key = st.text_input(
             "API Key",
             value=os.getenv("AZURE_API_KEY", ""),
             type="password",
-            help="Project API key (AI Foundry Home) or Azure OpenAI key (Models page)",
+            help="From AI Foundry Home page → API key field",
         )
         _agent = st.text_input(
-            "Agent Name or ID",
-            value=os.getenv("AZURE_AGENT_NAME", os.getenv("AZURE_AGENT_ID", "dev-ktech-demo")),
-            help="Agent name from AI Foundry → Build → Agents, or paste the full assistant ID (asst_xxx)",
+            "Agent Name",
+            value=os.getenv("AZURE_AGENT_NAME", "dev-ktech-demo"),
+            help="Exact name shown in AI Foundry → Build → Agents",
         )
         if st.button("🔗 Connect", type="primary", use_container_width=True):
             with st.spinner("Connecting…"):
                 try:
-                    _oai = _build_openai_client(_ep, _key)
-                    _aid = _resolve_agent_id(_oai, _agent)
-                    st.session_state.update({"_oai": _oai, "_agent_id": _aid, "_agent_name": _agent})
-                    st.success(f"Connected!  Agent resolved to `{_aid[:24]}…`")
+                    _c = _build_client(_ep, _key)
+                    st.session_state.update(
+                        {"_client": _c, "_agent_name": _agent, "prev_response_id": None}
+                    )
+                    st.success(f"Connected!  Agent: **{_agent}**")
                 except Exception as exc:
                     st.error(f"Connection failed: {exc}")
 
     st.divider()
     if st.button("🔄 New Conversation", use_container_width=True):
-        st.session_state.update({"messages": [], "thread_id": None})
+        st.session_state.update({"messages": [], "prev_response_id": None})
         st.rerun()
 
     st.divider()
@@ -363,7 +334,8 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-    st.caption("Powered by Azure AI Foundry · GPT-4o · Azure AI Search")
+    st.caption("Powered by Azure AI Foundry · GPT-4o · Responses API")
+
 
 # ── Main header ────────────────────────────────────────────────────────────────
 st.markdown(
@@ -376,18 +348,18 @@ st.markdown(
 )
 
 # ── Ready check ────────────────────────────────────────────────────────────────
-oai, agent_id = _ensure_ready()
-_ready = oai is not None and agent_id is not None
+client, agent_name = _ensure_ready()
+_ready = client is not None and bool(agent_name)
 
 if not _ready:
     st.info(
-        "👈 **Configure your Azure credentials** in the sidebar to begin.\n\n"
-        "You need:\n"
-        "- **Project Endpoint** – from AI Foundry Home page (Project endpoint field).\n"
-        "  Append `/api/projects/_project` if the URL ends with `.services.ai.azure.com`\n"
-        "- **API Key** – from AI Foundry Home page (API key field)\n"
-        "- **Agent Name** – `dev-ktech-demo` (or whatever your agent is named)\n\n"
-        "Or set `AZURE_AI_ENDPOINT`, `AZURE_API_KEY`, and `AZURE_AGENT_NAME` in a `.env` file."
+        "👈 **Configure your Azure credentials** in the sidebar.\n\n"
+        "**Where to find your Endpoint (Responses):**\n"
+        "1. AI Foundry → Build → Agents → click `dev-ktech-demo`\n"
+        "2. Click **Publish** (top-right) → copy **Endpoint (Responses)**\n"
+        "   e.g. `https://resource.services.ai.azure.com/api/projects/name/openai/v1/responses`\n\n"
+        "**API Key:** AI Foundry Home page → API key field\n\n"
+        "Or set `AZURE_AI_ENDPOINT`, `AZURE_API_KEY`, `AZURE_AGENT_NAME` in a `.env` file."
     )
 
 # ── Chat history ───────────────────────────────────────────────────────────────
@@ -410,14 +382,19 @@ if user_input and _ready:
     with st.chat_message("assistant", avatar="🤖"):
         with st.spinner("Searching knowledge base and computing estimate…"):
             try:
-                resp, new_tid = _run_query(oai, agent_id, user_input, st.session_state["thread_id"])
-                st.session_state["thread_id"] = new_tid
-                parsed = _parse(resp)
+                resp_text, new_resp_id = _run_query(
+                    client,
+                    agent_name,
+                    user_input,
+                    st.session_state["prev_response_id"],
+                )
+                st.session_state["prev_response_id"] = new_resp_id
+                parsed = _parse(resp_text)
                 if parsed["has_estimate"]:
                     _render_card(parsed)
-                st.markdown(resp)
+                st.markdown(resp_text)
                 st.session_state["messages"].append(
-                    {"role": "assistant", "content": resp, "parsed": parsed}
+                    {"role": "assistant", "content": resp_text, "parsed": parsed}
                 )
             except Exception as exc:
                 err = f"❌ Error: {exc}"
