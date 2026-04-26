@@ -84,52 +84,42 @@ for _k, _v in {
 # ── Client factory (Responses API) ────────────────────────────────────────────
 def _build_client(endpoint: str, api_key: str):
     """
-    Return an OpenAI client configured for the Azure AI Foundry Responses API.
+    Return an openai.OpenAI client whose base_url ends with /v1/.
+
+    Azure requires /v1/ in the URL **path** — NOT as ?api-version=v1.
+    Using the plain OpenAI client (not AzureOpenAI) avoids the automatic
+    ?api-version query parameter that AzureOpenAI always appends.
 
     Accepted endpoint formats
     ─────────────────────────
-    A) "Endpoint (Responses)" copied directly from the agent Playground panel:
+    A) Full "Endpoint (Responses)" from the agent Playground publish panel:
        https://resource.services.ai.azure.com/api/projects/name/openai/v1/responses
-       → strips /responses, uses remainder as base_url
-
-    B) Full OpenAI v1 path (no /responses suffix):
-       https://resource.services.ai.azure.com/api/projects/name/openai/v1
-
-    C) Project endpoint (shorter form):
+    B) .../openai/v1   (no trailing /responses)
+    C) Project endpoint only:
        https://resource.services.ai.azure.com/api/projects/name
-       https://resource.services.ai.azure.com   (appends /api/projects/_project)
-
-    D) Classic Azure OpenAI endpoint:
-       https://resource.openai.azure.com
+    D) Base AI Services domain:
+       https://resource.services.ai.azure.com   → appends /api/projects/_project
     """
+    from openai import OpenAI
+
     ep = endpoint.rstrip("/")
 
-    if "openai.azure.com" in ep:
-        # ── Classic Azure OpenAI endpoint ──────────────────────────────────
-        from openai import AzureOpenAI
-        return AzureOpenAI(azure_endpoint=ep, api_key=api_key, api_version="v1")
-
-    # ── Azure AI Foundry / AI Services endpoint ────────────────────────────
-    from openai import AzureOpenAI
-
-    # Normalise to the project path if only the base domain was given
-    if "services.ai.azure.com" in ep and "/api/projects/" not in ep:
-        ep += "/api/projects/_project"
-
-    # Strip /responses suffix to get the base OpenAI v1 URL
     if ep.endswith("/responses"):
-        ep = ep[: -len("/responses")]
-
-    # ep should now end with .../openai/v1  OR  .../api/projects/name
-    # AzureOpenAI needs the endpoint BEFORE /openai; trim /openai/v1 if present
-    if ep.endswith("/openai/v1"):
-        azure_ep = ep[: -len("/openai/v1")]
-    elif ep.endswith("/openai"):
-        azure_ep = ep[: -len("/openai")]
+        # A) strip /responses — OpenAI client will append it automatically
+        base_url = ep[: -len("responses")]          # keeps trailing slash → .../v1/
+    elif ep.endswith("/v1"):
+        # B) already at the right level
+        base_url = ep + "/"
+    elif "/openai/v1" in ep:
+        # somewhere in the middle — truncate and re-add trailing slash
+        base_url = ep[: ep.index("/openai/v1") + len("/openai/v1")] + "/"
     else:
-        azure_ep = ep
+        # C / D) project or base domain — append /openai/v1/
+        if "services.ai.azure.com" in ep and "/api/projects/" not in ep:
+            ep += "/api/projects/_project"
+        base_url = ep + "/openai/v1/"
 
-    return AzureOpenAI(azure_endpoint=azure_ep, api_key=api_key, api_version="v1")
+    return OpenAI(api_key=api_key, base_url=base_url)
 
 
 # ── Formatting guide appended to user messages ────────────────────────────────
