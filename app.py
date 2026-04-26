@@ -180,21 +180,23 @@ def _get_pdf_bytes(item: dict) -> bytes | None:
 
 # ── Client factory ─────────────────────────────────────────────────────────────
 def _build_client(endpoint: str, api_key: str):
-    """Plain OpenAI client with /v1/ baked into base_url (no ?api-version param)."""
+    """OpenAI client pointed at the project-level /openai/v1/ endpoint.
+
+    Accepts any form of the Azure AI Foundry URL — project base, agent-protocol
+    URL, or the full /responses path — and normalises down to the project base.
+    The agent is then referenced per-request via extra_body["agent_reference"].
+    """
     from openai import OpenAI
 
     ep = endpoint.rstrip("/")
 
-    if ep.endswith("/responses"):
-        base_url = ep[: -len("responses")]
-    elif ep.endswith("/v1"):
-        base_url = ep + "/"
-    elif "/openai/v1" in ep:
-        base_url = ep[: ep.index("/openai/v1") + len("/openai/v1")] + "/"
-    else:
-        if "services.ai.azure.com" in ep and "/api/projects/" not in ep:
-            ep += "/api/projects/_project"
-        base_url = ep + "/openai/v1/"
+    # Strip any agent / protocol / v1 suffix so we land on the project base
+    for marker in ("/agents/", "/openai/v1", "/openai/"):
+        if marker in ep:
+            ep = ep[: ep.index(marker)]
+            break
+
+    base_url = ep.rstrip("/") + "/openai/v1/"
 
     return OpenAI(
         api_key=api_key,
@@ -220,8 +222,8 @@ _GUIDE = (
 
 def _run_query(client, agent_name: str, user_text: str, prev_id: str | None) -> tuple[str, str]:
     kwargs: dict = dict(
-        model=agent_name,
         input=[{"role": "user", "content": user_text + _GUIDE}],
+        extra_body={"agent_reference": {"name": agent_name, "type": "agent_reference"}},
     )
     if prev_id:
         kwargs["previous_response_id"] = prev_id
