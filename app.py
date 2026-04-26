@@ -92,6 +92,9 @@ for _k, _v in {
     st.session_state.setdefault(_k, _v)
 
 # ── Azure Blob Storage — project PDF files ─────────────────────────────────────
+_APP_DIR = Path(__file__).parent
+
+
 def _build_container_client():
     """Return a ContainerClient if storage env vars are set, else None."""
     try:
@@ -107,7 +110,7 @@ def _build_container_client():
 
 
 def _index_blobs(container_client) -> dict[str, str]:
-    """List all blobs and map each RJ### code in the blob name → blob name."""
+    """List blobs and map each RJ### code in the blob name → blob name."""
     index: dict[str, str] = {}
     if container_client is None:
         return index
@@ -121,21 +124,36 @@ def _index_blobs(container_client) -> dict[str, str]:
     return index
 
 
+def _index_local_files() -> dict[str, Path]:
+    """Fallback: scan repo directory for PDFs with RJ### in the filename."""
+    index: dict[str, Path] = {}
+    for pdf in _APP_DIR.glob("**/*.pdf"):
+        for code in re.findall(r"RJ\d{3,4}", pdf.name, re.IGNORECASE):
+            index[code.upper()] = pdf
+    return index
+
+
 _CONTAINER_CLIENT, _CONTAINER_NAME = _build_container_client()
-_PDF_INDEX: dict[str, str] = _index_blobs(_CONTAINER_CLIENT)  # code → blob name
+_BLOB_INDEX: dict[str, str] = _index_blobs(_CONTAINER_CLIENT)   # code → blob name
+_LOCAL_INDEX: dict[str, Path] = _index_local_files()            # code → local path (fallback)
 
 
 def _find_related_files(refs: list[str]) -> list[dict]:
-    """Return [{code, blob_name, name}] for refs that have a matching blob."""
+    """
+    Return file descriptors for each ref.
+    Azure blob is used when available; local file is the fallback.
+    """
     results = []
     for ref in refs:
-        blob_name = _PDF_INDEX.get(ref.upper())
+        code = ref.upper()
+        blob_name = _BLOB_INDEX.get(code)
+        local_path = _LOCAL_INDEX.get(code)
         if blob_name:
-            results.append({
-                "code": ref.upper(),
-                "blob_name": blob_name,
-                "name": Path(blob_name).name,
-            })
+            results.append({"code": code, "source": "blob",
+                            "blob_name": blob_name, "name": Path(blob_name).name})
+        elif local_path:
+            results.append({"code": code, "source": "local",
+                            "path": local_path, "name": local_path.name})
     return results
 
 
@@ -146,6 +164,16 @@ def _download_blob(blob_name: str) -> bytes | None:
         return None
     try:
         return _CONTAINER_CLIENT.get_blob_client(blob_name).download_blob().readall()
+    except Exception:
+        return None
+
+
+def _get_pdf_bytes(item: dict) -> bytes | None:
+    """Resolve bytes from blob or local path depending on source."""
+    if item["source"] == "blob":
+        return _download_blob(item["blob_name"])
+    try:
+        return item["path"].read_bytes()
     except Exception:
         return None
 
@@ -248,22 +276,23 @@ def _render_project_files(refs: list[str], key_pfx: str):
     if not files:
         return
 
-    with st.expander(f"📁  Related Project Files  ({len(files)} available)", expanded=False):
+    with st.expander(f"📁  Related Project Files  ({len(files)} available)", expanded=True):
         for item in files:
             # ── file row ──────────────────────────────────────────────────────
             c_info, c_dl, c_prev = st.columns([5, 1, 1])
             with c_info:
+                src_label = "Azure" if item["source"] == "blob" else "Local"
                 st.markdown(
                     f'<div class="proj-file-row">'
                     f'<span class="proj-file-icon">📄</span>'
                     f'<div>'
                     f'<div class="proj-file-name">{item["name"]}</div>'
-                    f'<div class="proj-file-code">{item["code"]}</div>'
+                    f'<div class="proj-file-code">{item["code"]} · {src_label}</div>'
                     f'</div></div>',
                     unsafe_allow_html=True,
                 )
             with c_dl:
-                pdf_bytes = _download_blob(item["blob_name"])
+                pdf_bytes = _get_pdf_bytes(item)
                 if pdf_bytes:
                     st.download_button(
                         "⬇️ Download",
@@ -273,9 +302,6 @@ def _render_project_files(refs: list[str], key_pfx: str):
                         key=f"dl_{key_pfx}_{item['code']}",
                         use_container_width=True,
                     )
-                else:
-                    st.button("⬇️ N/A", key=f"dl_{key_pfx}_{item['code']}",
-                              disabled=True, use_container_width=True)
             with c_prev:
                 toggle_key = f"show_{key_pfx}_{item['code']}"
                 if toggle_key not in st.session_state:
@@ -287,7 +313,7 @@ def _render_project_files(refs: list[str], key_pfx: str):
 
             # ── inline PDF preview ────────────────────────────────────────────
             if st.session_state.get(toggle_key, False):
-                preview_bytes = _download_blob(item["blob_name"])
+                preview_bytes = _get_pdf_bytes(item)
                 if preview_bytes:
                     b64 = base64.b64encode(preview_bytes).decode()
                     st.markdown(
@@ -298,7 +324,7 @@ def _render_project_files(refs: list[str], key_pfx: str):
                         unsafe_allow_html=True,
                     )
                 else:
-                    st.warning("Could not load PDF from Azure Blob Storage.")
+                    st.warning("PDF could not be loaded.")
 
 
 def _render_card(p: dict, key_pfx: str = "0"):
