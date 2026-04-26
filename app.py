@@ -1,13 +1,14 @@
 """
-Synacal Manufacturing Cost Estimator
-Conversational AI estimator using Azure AI Foundry Responses API + Streamlit
+Waltonen Quote Estimator Demo
+Built by KitelyTech — Azure AI Foundry Responses API + Streamlit
 """
+import base64
+import glob
 import os
 import re
 import warnings
-from datetime import datetime
+from pathlib import Path
 
-# Suppress openai v2.x deprecation noise (Responses API is the preferred API anyway)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import streamlit as st
@@ -17,15 +18,14 @@ load_dotenv()
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Synacal Cost Estimator",
-    page_icon="⚙️",
+    page_title="Waltonen Quote Estimator",
+    page_icon="📐",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ── CSS ────────────────────────────────────────────────────────────────────────
-st.markdown(
-    """<style>
+st.markdown("""<style>
 [data-testid="stAppViewContainer"] { background:#0d1117; }
 [data-testid="stSidebar"] { background:#161b22 !important; border-right:1px solid #30363d; }
 [data-testid="stSidebar"] .stMarkdown p { color:#8b949e; }
@@ -58,7 +58,19 @@ st.markdown(
     margin:4px 3px 0; font-family:monospace;
 }
 
-.est-header { color:#58a6ff; font-size:.8rem; font-weight:600; letter-spacing:1px; text-transform:uppercase; margin-bottom:10px; }
+.est-header {
+    color:#58a6ff; font-size:.8rem; font-weight:600;
+    letter-spacing:1px; text-transform:uppercase; margin-bottom:10px;
+}
+
+.proj-file-row {
+    display:flex; align-items:center; gap:10px;
+    background:#161b22; border:1px solid #21262d;
+    border-radius:8px; padding:10px 14px; margin-bottom:8px;
+}
+.proj-file-icon { font-size:1.4rem; }
+.proj-file-name { color:#e6edf3; font-size:.88rem; font-weight:600; flex:1; }
+.proj-file-code { color:#56d364; font-size:.78rem; font-family:monospace; }
 
 .app-header {
     background:linear-gradient(135deg,#0d1117,#161b22,#1c2128);
@@ -66,55 +78,58 @@ st.markdown(
     border-radius:12px; padding:24px 28px; margin-bottom:20px;
 }
 .app-header h1 { color:#e6edf3; margin:0; font-size:1.7rem; font-weight:800; }
-.app-header p { color:#8b949e; margin:6px 0 0; font-size:.9rem; }
-</style>""",
-    unsafe_allow_html=True,
-)
+.app-header p  { color:#8b949e; margin:6px 0 0; font-size:.9rem; }
+
+.built-by { color:#484f58; font-size:.7rem; text-align:center; margin-top:4px; }
+</style>""", unsafe_allow_html=True)
 
 # ── Session state ──────────────────────────────────────────────────────────────
 for _k, _v in {
     "messages": [],
-    "prev_response_id": None,   # chains Responses API turns together
+    "prev_response_id": None,
     "_client": None,
     "_agent_name": None,
 }.items():
     st.session_state.setdefault(_k, _v)
 
+# ── Project files index ────────────────────────────────────────────────────────
+_APP_DIR = Path(__file__).parent
 
-# ── Client factory (Responses API) ────────────────────────────────────────────
+def _index_project_files() -> dict[str, Path]:
+    """Scan for PDFs and map each RJ### code found in the filename to its path."""
+    index: dict[str, Path] = {}
+    for pdf in _APP_DIR.glob("**/*.pdf"):
+        for code in re.findall(r"RJ\d{3,4}", pdf.name, re.IGNORECASE):
+            index[code.upper()] = pdf
+    return index
+
+_PDF_INDEX = _index_project_files()   # built once at startup
+
+
+def _find_related_files(refs: list[str]) -> list[dict]:
+    """Return [{code, path, name}] for refs that have a matching local PDF."""
+    results = []
+    for ref in refs:
+        path = _PDF_INDEX.get(ref.upper())
+        if path:
+            results.append({"code": ref.upper(), "path": path, "name": path.name})
+    return results
+
+
+# ── Client factory ─────────────────────────────────────────────────────────────
 def _build_client(endpoint: str, api_key: str):
-    """
-    Return an openai.OpenAI client whose base_url ends with /v1/.
-
-    Azure requires /v1/ in the URL **path** — NOT as ?api-version=v1.
-    Using the plain OpenAI client (not AzureOpenAI) avoids the automatic
-    ?api-version query parameter that AzureOpenAI always appends.
-
-    Accepted endpoint formats
-    ─────────────────────────
-    A) Full "Endpoint (Responses)" from the agent Playground publish panel:
-       https://resource.services.ai.azure.com/api/projects/name/openai/v1/responses
-    B) .../openai/v1   (no trailing /responses)
-    C) Project endpoint only:
-       https://resource.services.ai.azure.com/api/projects/name
-    D) Base AI Services domain:
-       https://resource.services.ai.azure.com   → appends /api/projects/_project
-    """
+    """Plain OpenAI client with /v1/ baked into base_url (no ?api-version param)."""
     from openai import OpenAI
 
     ep = endpoint.rstrip("/")
 
     if ep.endswith("/responses"):
-        # A) strip /responses — OpenAI client will append it automatically
-        base_url = ep[: -len("responses")]          # keeps trailing slash → .../v1/
+        base_url = ep[: -len("responses")]
     elif ep.endswith("/v1"):
-        # B) already at the right level
         base_url = ep + "/"
     elif "/openai/v1" in ep:
-        # somewhere in the middle — truncate and re-add trailing slash
         base_url = ep[: ep.index("/openai/v1") + len("/openai/v1")] + "/"
     else:
-        # C / D) project or base domain — append /openai/v1/
         if "services.ai.azure.com" in ep and "/api/projects/" not in ep:
             ep += "/api/projects/_project"
         base_url = ep + "/openai/v1/"
@@ -122,7 +137,7 @@ def _build_client(endpoint: str, api_key: str):
     return OpenAI(api_key=api_key, base_url=base_url)
 
 
-# ── Formatting guide appended to user messages ────────────────────────────────
+# ── Formatting guide ───────────────────────────────────────────────────────────
 _GUIDE = (
     "\n\n---\n"
     "RESPONSE FORMAT — always use these exact section headers for estimates:\n\n"
@@ -136,27 +151,16 @@ _GUIDE = (
 )
 
 
-def _run_query(
-    client,
-    agent_name: str,
-    user_text: str,
-    prev_response_id: str | None,
-) -> tuple[str, str]:
-    """
-    Call the Azure AI Foundry Responses API.
-    Returns (response_text, new_response_id).
-    Chains turns via previous_response_id for full conversation context.
-    """
+def _run_query(client, agent_name: str, user_text: str, prev_id: str | None) -> tuple[str, str]:
     kwargs: dict = dict(
         model=agent_name,
         input=[{"role": "user", "content": user_text + _GUIDE}],
     )
-    if prev_response_id:
-        kwargs["previous_response_id"] = prev_response_id
+    if prev_id:
+        kwargs["previous_response_id"] = prev_id
 
     response = client.responses.create(**kwargs)
 
-    # Extract text — output_text is the convenience attribute in openai v2.x
     text: str = getattr(response, "output_text", "") or ""
     if not text:
         for item in getattr(response, "output", []):
@@ -176,12 +180,11 @@ def _parse(text: str) -> dict:
 
     def cost(*labels):
         for lbl in labels:
-            pats = [
+            for pat in [
                 rf"\*{{0,2}}{re.escape(lbl)}\*{{0,2}}\**\s*[:\-]\s*(?:USD\s*)?\$?([\d,]+(?:\.\d{{1,2}})?)",
                 rf"\*{{0,2}}{re.escape(lbl)}\*{{0,2}}\**\s*[:\-]\s*([\d,]+(?:\.\d{{1,2}})?)\s*USD",
-            ]
-            for p in pats:
-                m = re.search(p, text, re.IGNORECASE)
+            ]:
+                m = re.search(pat, text, re.IGNORECASE)
                 if m:
                     return float(m.group(1).replace(",", ""))
         return None
@@ -189,18 +192,14 @@ def _parse(text: str) -> dict:
     mat = cost("material cost", "material costs", "materials cost", "materials")
     lab = cost("labor cost", "labour cost", "labor", "labour", "installation cost", "fabrication cost")
     tot = cost("total estimate", "total cost", "grand total", "total")
-
-    if tot is None and mat is not None and lab is not None:
+    if tot is None and mat and lab:
         tot = mat + lab
 
     tl = timeline()
     return {
         "has_estimate": bool(refs or tl or mat or lab or tot),
-        "timeline": tl,
-        "material_cost": mat,
-        "labor_cost": lab,
-        "total_cost": tot,
-        "references": refs,
+        "timeline": tl, "material_cost": mat, "labor_cost": lab,
+        "total_cost": tot, "references": refs,
     }
 
 
@@ -209,7 +208,59 @@ def _usd(v):
     return f"USD {v:,.0f}" if v is not None else "—"
 
 
-def _render_card(p: dict):
+def _render_project_files(refs: list[str], key_pfx: str):
+    """Expandable section showing downloadable + previewable PDFs for each ref."""
+    files = _find_related_files(refs)
+    if not files:
+        return
+
+    with st.expander(f"📁  Related Project Files  ({len(files)} available)", expanded=False):
+        for item in files:
+            pdf_bytes = item["path"].read_bytes()
+            b64 = base64.b64encode(pdf_bytes).decode()
+
+            # ── file row ──────────────────────────────────────────────────────
+            c_info, c_dl, c_prev = st.columns([5, 1, 1])
+            with c_info:
+                st.markdown(
+                    f'<div class="proj-file-row">'
+                    f'<span class="proj-file-icon">📄</span>'
+                    f'<div>'
+                    f'<div class="proj-file-name">{item["name"]}</div>'
+                    f'<div class="proj-file-code">{item["code"]}</div>'
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c_dl:
+                st.download_button(
+                    "⬇️ Download",
+                    data=pdf_bytes,
+                    file_name=item["name"],
+                    mime="application/pdf",
+                    key=f"dl_{key_pfx}_{item['code']}",
+                    use_container_width=True,
+                )
+            with c_prev:
+                toggle_key = f"show_{key_pfx}_{item['code']}"
+                if toggle_key not in st.session_state:
+                    st.session_state[toggle_key] = False
+                label = "🙈 Hide" if st.session_state[toggle_key] else "👁️ Preview"
+                if st.button(label, key=f"btn_{key_pfx}_{item['code']}", use_container_width=True):
+                    st.session_state[toggle_key] = not st.session_state[toggle_key]
+                    st.rerun()
+
+            # ── inline PDF preview ────────────────────────────────────────────
+            if st.session_state.get(toggle_key, False):
+                st.markdown(
+                    f'<iframe src="data:application/pdf;base64,{b64}" '
+                    f'width="100%" height="680" '
+                    f'style="border:1px solid #30363d;border-radius:8px;'
+                    f'margin:8px 0 16px"></iframe>',
+                    unsafe_allow_html=True,
+                )
+
+
+def _render_card(p: dict, key_pfx: str = "0"):
     st.markdown('<div class="est-header">📋 Estimate Summary</div>', unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns(3)
@@ -241,6 +292,9 @@ def _render_card(p: dict):
             f'<div>{badges}</div></div>',
             unsafe_allow_html=True,
         )
+        st.markdown("")  # breathing room before the expander
+        _render_project_files(p["references"], key_pfx=key_pfx)
+
     st.divider()
 
 
@@ -266,43 +320,9 @@ def _ensure_ready():
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## ⚙️ Synacal\n**Cost Estimator**")
+    st.markdown("## 📐 Waltonen\n**Quote Estimator**")
     st.divider()
 
-    _cfg_open = not bool(os.getenv("AZURE_API_KEY") and os.getenv("AZURE_AI_ENDPOINT"))
-    with st.expander("🔑 Azure Configuration", expanded=_cfg_open):
-        st.caption(
-            "Paste the **Endpoint (Responses)** URL from your agent's "
-            "Playground → *(three-dot menu / Publish panel)*"
-        )
-        _ep = st.text_input(
-            "Endpoint (Responses)",
-            value=os.getenv("AZURE_AI_ENDPOINT", ""),
-            placeholder="https://resource.services.ai.azure.com/api/projects/name/openai/v1/responses",
-        )
-        _key = st.text_input(
-            "API Key",
-            value=os.getenv("AZURE_API_KEY", ""),
-            type="password",
-            help="From AI Foundry Home page → API key field",
-        )
-        _agent = st.text_input(
-            "Agent Name",
-            value=os.getenv("AZURE_AGENT_NAME", "dev-ktech-demo"),
-            help="Exact name shown in AI Foundry → Build → Agents",
-        )
-        if st.button("🔗 Connect", type="primary", use_container_width=True):
-            with st.spinner("Connecting…"):
-                try:
-                    _c = _build_client(_ep, _key)
-                    st.session_state.update(
-                        {"_client": _c, "_agent_name": _agent, "prev_response_id": None}
-                    )
-                    st.success(f"Connected!  Agent: **{_agent}**")
-                except Exception as exc:
-                    st.error(f"Connection failed: {exc}")
-
-    st.divider()
     if st.button("🔄 New Conversation", use_container_width=True):
         st.session_state.update({"messages": [], "prev_response_id": None})
         st.rerun()
@@ -325,13 +345,14 @@ with st.sidebar:
 
     st.divider()
     st.caption("Powered by Azure AI Foundry · GPT-4o · Responses API")
+    st.markdown('<div class="built-by">Built by KitelyTech</div>', unsafe_allow_html=True)
 
 
 # ── Main header ────────────────────────────────────────────────────────────────
 st.markdown(
     """<div class="app-header">
-    <h1>⚙️ Manufacturing Cost Estimator</h1>
-    <p>AI-powered instant estimates from Synacal's historical project knowledge base ·
+    <h1>📐 Waltonen Quote Estimator</h1>
+    <p>AI-powered instant manufacturing cost estimates from historical project data ·
     Ask for any manufacturing, signage, or furniture project quote</p>
 </div>""",
     unsafe_allow_html=True,
@@ -342,22 +363,17 @@ client, agent_name = _ensure_ready()
 _ready = client is not None and bool(agent_name)
 
 if not _ready:
-    st.info(
-        "👈 **Configure your Azure credentials** in the sidebar.\n\n"
-        "**Where to find your Endpoint (Responses):**\n"
-        "1. AI Foundry → Build → Agents → click `dev-ktech-demo`\n"
-        "2. Click **Publish** (top-right) → copy **Endpoint (Responses)**\n"
-        "   e.g. `https://resource.services.ai.azure.com/api/projects/name/openai/v1/responses`\n\n"
-        "**API Key:** AI Foundry Home page → API key field\n\n"
-        "Or set `AZURE_AI_ENDPOINT`, `AZURE_API_KEY`, `AZURE_AGENT_NAME` in a `.env` file."
+    st.error(
+        "⚠️ Azure connection not configured. "
+        "Set `AZURE_AI_ENDPOINT`, `AZURE_API_KEY`, and `AZURE_AGENT_NAME` in your `.env` file."
     )
 
 # ── Chat history ───────────────────────────────────────────────────────────────
-for _msg in st.session_state["messages"]:
+for _i, _msg in enumerate(st.session_state["messages"]):
     _av = "👤" if _msg["role"] == "user" else "🤖"
     with st.chat_message(_msg["role"], avatar=_av):
         if _msg["role"] == "assistant" and _msg.get("parsed", {}).get("has_estimate"):
-            _render_card(_msg["parsed"])
+            _render_card(_msg["parsed"], key_pfx=str(_i))
         st.markdown(_msg["content"])
 
 # ── Input ──────────────────────────────────────────────────────────────────────
@@ -373,15 +389,14 @@ if user_input and _ready:
         with st.spinner("Searching knowledge base and computing estimate…"):
             try:
                 resp_text, new_resp_id = _run_query(
-                    client,
-                    agent_name,
-                    user_input,
+                    client, agent_name, user_input,
                     st.session_state["prev_response_id"],
                 )
                 st.session_state["prev_response_id"] = new_resp_id
                 parsed = _parse(resp_text)
+                msg_key = str(len(st.session_state["messages"]))
                 if parsed["has_estimate"]:
-                    _render_card(parsed)
+                    _render_card(parsed, key_pfx=msg_key)
                 st.markdown(resp_text)
                 st.session_state["messages"].append(
                     {"role": "assistant", "content": resp_text, "parsed": parsed}
