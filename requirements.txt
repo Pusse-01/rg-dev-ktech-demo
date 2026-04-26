@@ -1,0 +1,5 @@
+streamlit>=1.35.0
+azure-ai-projects>=2.0.0
+azure-core>=1.30.0
+openai>=1.30.0
+python-dotenv>=1.0.0
