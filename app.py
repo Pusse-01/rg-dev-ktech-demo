@@ -180,27 +180,34 @@ def _get_pdf_bytes(item: dict) -> bytes | None:
 
 # ── Client factory ─────────────────────────────────────────────────────────────
 def _build_client(endpoint: str, api_key: str):
-    """OpenAI client pointed at the project-level /openai/v1/ endpoint.
+    """Return an OpenAI client via AIProjectClient using API-key auth.
 
-    Accepts any form of the Azure AI Foundry URL — project base, agent-protocol
-    URL, or the full /responses path — and normalises down to the project base.
-    The agent is then referenced per-request via extra_body["agent_reference"].
+    Accepts any Azure AI Foundry URL form (project base, agent-protocol URL,
+    or full /responses path) and normalises to the project base endpoint.
+    Uses AzureKeyCredential — never DefaultAzureCredential.
     """
-    from openai import OpenAI
+    from azure.core.credentials import AzureKeyCredential
+    from azure.ai.projects import AIProjectClient
 
     ep = endpoint.rstrip("/")
 
-    # Strip any agent / protocol / v1 suffix so we land on the project base
+    # Normalise to project base: strip agent / protocol / openai path segments
     for marker in ("/agents/", "/openai/v1", "/openai/"):
         if marker in ep:
             ep = ep[: ep.index(marker)]
             break
 
-    base_url = ep.rstrip("/") + "/openai/v1/"
+    project_client = AIProjectClient(
+        endpoint=ep,
+        credential=AzureKeyCredential(api_key),
+    )
 
-    return OpenAI(
+    # Pass api_key and base_url explicitly:
+    # - api_key   → skips get_bearer_token_provider, so DefaultAzureCredential is never called
+    # - base_url  → ensures trailing slash so the SDK appends /responses correctly
+    return project_client.get_openai_client(
         api_key=api_key,
-        base_url=base_url,
+        base_url=ep.rstrip("/") + "/openai/v1/",
         default_query={"api-version": "2025-05-15-preview"},
         default_headers={"api-key": api_key},
     )
