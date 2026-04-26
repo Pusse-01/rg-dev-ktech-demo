@@ -7,12 +7,13 @@ import os
 import re
 import warnings
 from pathlib import Path
-
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.projects import AIProjectClient
+from azure.identity import DefaultAzureCredential
 import streamlit as st
 from dotenv import load_dotenv
 
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 load_dotenv()
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -177,50 +178,56 @@ def _get_pdf_bytes(item: dict) -> bytes | None:
     except Exception:
         return None
 
-
 # ── Client factory ─────────────────────────────────────────────────────────────
 def _build_client(endpoint: str, api_key: str):
-    """Return an OpenAI client via AIProjectClient using API-key auth.
-
-    Accepts any Azure AI Foundry URL form (project base, agent-protocol URL,
-    or full /responses path) and normalises to the project base endpoint.
-    Uses AzureKeyCredential — never DefaultAzureCredential.
     """
-    from azure.core.credentials import AzureKeyCredential
-    from azure.ai.projects import AIProjectClient
-
-    ep = endpoint.rstrip("/")
-
-    # Normalise to project base: strip agent / protocol / openai path segments
-    for marker in ("/agents/", "/openai/v1", "/openai/"):
-        if marker in ep:
-            ep = ep[: ep.index(marker)]
-            break
+    Uses the API Key from your .env. Removed .project_name to fix the AttributeError.
+    """
+    # Use the API key explicitly
+    credential = DefaultAzureCredential()
 
     project_client = AIProjectClient(
-        endpoint=ep,
-        credential=AzureKeyCredential(api_key),
+        endpoint=endpoint,
+        credential=credential,
     )
+    
+    # We'll show a generic success message since .project_name isn't available
+    # st.success("✅ Successfully connected to Azure AI Foundry")
+    return project_client.get_openai_client()
 
-    # Pass api_key and base_url explicitly:
-    # - api_key   → skips get_bearer_token_provider, so DefaultAzureCredential is never called
-    # - base_url  → ensures trailing slash so the SDK appends /responses correctly
-    return project_client.get_openai_client(
-        api_key=api_key,
-        base_url=ep.rstrip("/") + "/openai/v1/",
-        default_query={"api-version": "2025-05-15-preview"},
-        default_headers={"api-key": api_key},
-    )
 
+# ── Auto-connect from env ──────────────────────────────────────────────────────
+def _ensure_ready():
+    client = st.session_state["_client"]
+    agent  = st.session_state["_agent_name"]
+
+    if client is None:
+        ep   = os.getenv("AZURE_AI_ENDPOINT", "")
+        key  = os.getenv("AZURE_API_KEY", "")
+        name = os.getenv("AZURE_AGENT_NAME", "dev-ktech-demo")
+        
+        if ep and key and name:
+            try:
+                client = _build_client(ep, key)
+                st.session_state.update({"_client": client, "_agent_name": name})
+                agent = name
+            except Exception as e:
+                # This catches real connection issues (like a bad API key)
+                st.error(f"❌ Connection failed: {e}")
+                return None, None
+        else:
+            return None, None
+
+    return client, agent
 
 # ── Formatting guide ───────────────────────────────────────────────────────────
 _GUIDE = (
     "\n\n---\n"
     "RESPONSE FORMAT — always use these exact section headers for estimates:\n\n"
     "- **Timeline**: [X weeks with brief phase breakdown]\n"
-    "- **Material Cost**: USD [amount]  *(raw materials & finishes)*\n"
-    "- **Labor Cost**: USD [amount]  *(fabrication & installation)*\n"
-    "- **Total Estimate**: USD [amount]\n"
+    "- **Material Cost**: [amount] USD  *(raw materials & finishes)*\n"
+    "- **Labor Cost**: [amount] USD  *(fabrication & installation)*\n"
+    "- **Total Estimate**: [amount] USD\n"
     "- **Reference Projects**: [list project codes from the knowledge base, e.g. RJ979, RJ908]\n\n"
     "If original data shows one combined cost, split it using typical industry ratios.\n"
     "---"
@@ -230,40 +237,101 @@ _GUIDE = (
 def _run_query(client, agent_name: str, user_text: str, prev_id: str | None) -> tuple[str, str]:
     kwargs: dict = dict(
         input=[{"role": "user", "content": user_text + _GUIDE}],
-        extra_body={"agent_reference": {"name": agent_name, "type": "agent_reference"}},
+        extra_body={"agent_reference": {"name": agent_name, "version": "9", "type": "agent_reference"}},
     )
     if prev_id:
         kwargs["previous_response_id"] = prev_id
 
     response = client.responses.create(**kwargs)
+    # st.write(f"⏳ Response ID: {response} · Tokens used: {getattr(response, 'tokens_used', 'N/A')}")
+
+    # Safely extract usage and response info
+    r_id = getattr(response, "id", getattr(response, "response_id", "unknown"))
+    usage = getattr(response, "usage", None)
+    tokens = getattr(usage, "total_tokens", "N/A") if usage else "N/A"
+    
+    st.write(f"⏳ Response ID: {r_id} · Tokens used: {tokens}")
 
     text: str = getattr(response, "output_text", "") or ""
+    st.write(response)
+    
+    # # UPDATED PARSING LOGIC: Extract data from memories or tools if output_text is empty
     if not text:
         for item in getattr(response, "output", []):
-            for c in getattr(item, "content", []):
-                text += getattr(c, "text", "")
+            # 1. Standard text content
+            content = getattr(item, "content", None)
+            if content:
+                if isinstance(content, list):
+                    for c in content:
+                        text += getattr(c, "text", "") + "\n\n"
+                elif isinstance(content, str):
+                    text += content + "\n\n"
+            
+            # 2. Memory Search calls (Handles the 'ResponseOutputMessage' log structure)
+            if getattr(item, "type", "") == "memory_search_call":
+                memories = getattr(item, "memories", [])
+                for mem in memories:
+                    if isinstance(mem, dict) and "content" in mem:
+                        text += mem["content"] + "\n\n"
+                        
+            # 3. Tool arguments (Fallback for 'McpApprovalRequest')
+            args = getattr(item, "arguments", "")
+            if isinstance(args, str) and args:
+                text += args + "\n\n"
 
-    return text.strip() or "No response received.", response.id
+    return text.strip() or "No response received.", r_id
 
 
 # ── Response parsing ───────────────────────────────────────────────────────────
+# def _parse(text: str) -> dict:
+#     refs = sorted(set(re.findall(r"\bRJ\d{3,4}\b", text, re.IGNORECASE)))
+
+#     def timeline():
+#         m = re.search(r"\*{0,2}timeline\*{0,2}\**\s*[:\-]\s*([^\n]{5,120})", text, re.IGNORECASE)
+#         return m.group(1).strip("* \t") if m else None
+
+#     def cost(*labels):
+#         for lbl in labels:
+#             for pat in [
+#                 rf"\*{{0,2}}{re.escape(lbl)}\*{{0,2}}\**\s*[:\-]\s*(?:USD\s*)?\$?([\d,]+(?:\.\d{{1,2}})?)",
+#                 rf"\*{{0,2}}{re.escape(lbl)}\*{{0,2}}\**\s*[:\-]\s*([\d,]+(?:\.\d{{1,2}})?)\s*USD",
+#             ]:
+#                 m = re.search(pat, text, re.IGNORECASE)
+#                 if m:
+#                     return float(m.group(1).replace(",", ""))
+#         return None
+
+#     mat = cost("material cost", "material costs", "materials cost", "materials")
+#     lab = cost("labor cost", "labour cost", "labor", "labour", "installation cost", "fabrication cost")
+#     tot = cost("total estimate", "total cost", "grand total", "total")
+#     if tot is None and mat and lab:
+#         tot = mat + lab
+
+#     tl = timeline()
+#     return {
+#         "has_estimate": bool(refs or tl or mat or lab or tot),
+#         "timeline": tl, "material_cost": mat, "labor_cost": lab,
+#         "total_cost": tot, "references": refs,
+#     }
 def _parse(text: str) -> dict:
+    # st.write(f"🔍 {text}")
     refs = sorted(set(re.findall(r"\bRJ\d{3,4}\b", text, re.IGNORECASE)))
 
     def timeline():
-        m = re.search(r"\*{0,2}timeline\*{0,2}\**\s*[:\-]\s*([^\n]{5,120})", text, re.IGNORECASE)
-        return m.group(1).strip("* \t") if m else None
+        m = re.search(r"\*{0,2}timeline\*{0,2}\**\s*[:\-]\s*(.+?)(?=\n(?:material|labor|total|reference)|$)", text, re.IGNORECASE | re.DOTALL)
+        return m.group(1).strip("* \t\n") if m else None
 
     def cost(*labels):
         for lbl in labels:
             for pat in [
                 rf"\*{{0,2}}{re.escape(lbl)}\*{{0,2}}\**\s*[:\-]\s*(?:USD\s*)?\$?([\d,]+(?:\.\d{{1,2}})?)",
+                rf"\*{{0,2}}{re.escape(lbl)}\*{{0,2}}\**\s*[:\-]\s*(?:USD\s*)?([\d,]+(?:\.\d{{1,2}})?)",
                 rf"\*{{0,2}}{re.escape(lbl)}\*{{0,2}}\**\s*[:\-]\s*([\d,]+(?:\.\d{{1,2}})?)\s*USD",
             ]:
                 m = re.search(pat, text, re.IGNORECASE)
                 if m:
                     return float(m.group(1).replace(",", ""))
-        return None
+        return None 
 
     mat = cost("material cost", "material costs", "materials cost", "materials")
     lab = cost("labor cost", "labour cost", "labor", "labour", "installation cost", "fabrication cost")
@@ -284,63 +352,84 @@ def _usd(v):
     return f"USD {v:,.0f}" if v is not None else "—"
 
 
-def _render_project_files(refs: list[str], key_pfx: str):
-    """Expandable section showing downloadable + previewable PDFs for each ref."""
-    files = _find_related_files(refs)
-    if not files:
-        return
+# def _render_project_files(refs: list[str], key_pfx: str):
+#     """Expandable section showing downloadable + previewable PDFs for each ref."""
+#     files = _find_related_files(refs)
+#     if not files:
+#         return
 
-    with st.expander(f"📁  Related Project Files  ({len(files)} available)", expanded=True):
+#     with st.expander(f"📁  Related Project Files  ({len(files)} available)", expanded=True):
+#         for item in files:
+#             # ── file row ──────────────────────────────────────────────────────
+#             c_info, c_dl, c_prev = st.columns([5, 1, 1])
+#             with c_info:
+#                 src_label = "Azure" if item["source"] == "blob" else "Local"
+#                 st.markdown(
+#                     f'<div class="proj-file-row">'
+#                     f'<span class="proj-file-icon">📄</span>'
+#                     f'<div>'
+#                     f'<div class="proj-file-name">{item["name"]}</div>'
+#                     f'<div class="proj-file-code">{item["code"]} · {src_label}</div>'
+#                     f'</div></div>',
+#                     unsafe_allow_html=True,
+#                 )
+#             with c_dl:
+#                 pdf_bytes = _get_pdf_bytes(item)
+#                 if pdf_bytes:
+#                     st.download_button(
+#                         "⬇️ Download",
+#                         data=pdf_bytes,
+#                         file_name=item["name"],
+#                         mime="application/pdf",
+#                         key=f"dl_{key_pfx}_{item['code']}",
+#                         use_container_width=True,
+#                     )
+#             with c_prev:
+#                 toggle_key = f"show_{key_pfx}_{item['code']}"
+#                 if toggle_key not in st.session_state:
+#                     st.session_state[toggle_key] = False
+#                 label = "🙈 Hide" if st.session_state[toggle_key] else "👁️ Preview"
+#                 if st.button(label, key=f"btn_{key_pfx}_{item['code']}", use_container_width=True):
+#                     st.session_state[toggle_key] = not st.session_state[toggle_key]
+#                     st.rerun()
+
+#             # ── inline PDF preview ────────────────────────────────────────────
+#             if st.session_state.get(toggle_key, False):
+#                 preview_bytes = _get_pdf_bytes(item)
+#                 if preview_bytes:
+#                     b64 = base64.b64encode(preview_bytes).decode()
+#                     st.markdown(
+#                         f'<iframe src="data:application/pdf;base64,{b64}" '
+#                         f'width="100%" height="680" '
+#                         f'style="border:1px solid #30363d;border-radius:8px;'
+#                         f'margin:8px 0 16px"></iframe>',
+#                         unsafe_allow_html=True,
+#                     )
+#                 else:
+#                     st.warning("PDF could not be loaded.")
+
+def _render_project_files(refs, key_pfx):
+    files = _find_related_files(refs)
+    if not files: return
+    with st.expander(f"📁  Related Project Files  ({len(files)})", expanded=True):
         for item in files:
-            # ── file row ──────────────────────────────────────────────────────
             c_info, c_dl, c_prev = st.columns([5, 1, 1])
             with c_info:
-                src_label = "Azure" if item["source"] == "blob" else "Local"
-                st.markdown(
-                    f'<div class="proj-file-row">'
-                    f'<span class="proj-file-icon">📄</span>'
-                    f'<div>'
-                    f'<div class="proj-file-name">{item["name"]}</div>'
-                    f'<div class="proj-file-code">{item["code"]} · {src_label}</div>'
-                    f'</div></div>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f'<div class="proj-file-row"><span class="proj-file-icon">📄</span>'
+                            f'<div><div class="proj-file-name">{item["name"]}</div>'
+                            f'<div class="proj-file-code">{item["code"]}</div></div></div>', unsafe_allow_html=True)
             with c_dl:
-                pdf_bytes = _get_pdf_bytes(item)
-                if pdf_bytes:
-                    st.download_button(
-                        "⬇️ Download",
-                        data=pdf_bytes,
-                        file_name=item["name"],
-                        mime="application/pdf",
-                        key=f"dl_{key_pfx}_{item['code']}",
-                        use_container_width=True,
-                    )
+                b = _get_pdf_bytes(item)
+                if b: st.download_button("⬇️", b, item["name"], "application/pdf", key=f"dl_{key_pfx}_{item['code']}")
             with c_prev:
-                toggle_key = f"show_{key_pfx}_{item['code']}"
-                if toggle_key not in st.session_state:
-                    st.session_state[toggle_key] = False
-                label = "🙈 Hide" if st.session_state[toggle_key] else "👁️ Preview"
-                if st.button(label, key=f"btn_{key_pfx}_{item['code']}", use_container_width=True):
-                    st.session_state[toggle_key] = not st.session_state[toggle_key]
+                t_key = f"sh_{key_pfx}_{item['code']}"
+                if st.button("👁️", key=f"bt_{key_pfx}_{item['code']}"):
+                    st.session_state[t_key] = not st.session_state.get(t_key, False)
                     st.rerun()
-
-            # ── inline PDF preview ────────────────────────────────────────────
-            if st.session_state.get(toggle_key, False):
-                preview_bytes = _get_pdf_bytes(item)
-                if preview_bytes:
-                    b64 = base64.b64encode(preview_bytes).decode()
-                    st.markdown(
-                        f'<iframe src="data:application/pdf;base64,{b64}" '
-                        f'width="100%" height="680" '
-                        f'style="border:1px solid #30363d;border-radius:8px;'
-                        f'margin:8px 0 16px"></iframe>',
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.warning("PDF could not be loaded.")
-
-
+            if st.session_state.get(t_key, False):
+                b = _get_pdf_bytes(item)
+                if b:
+                    b64 = base64.b64encode(b).decode()
 def _render_card(p: dict, key_pfx: str = "0"):
     st.markdown('<div class="est-header">📋 Estimate Summary</div>', unsafe_allow_html=True)
 
@@ -379,24 +468,25 @@ def _render_card(p: dict, key_pfx: str = "0"):
     st.divider()
 
 
-# ── Auto-connect from env ──────────────────────────────────────────────────────
-def _ensure_ready():
-    client = st.session_state["_client"]
-    agent  = st.session_state["_agent_name"]
+# # ── Auto-connect from env ──────────────────────────────────────────────────────
+# def _ensure_ready():
+#     client = st.session_state["_client"]
+#     agent  = st.session_state["_agent_name"]
 
-    if client is None:
-        ep   = os.getenv("AZURE_AI_ENDPOINT", "")
-        key  = os.getenv("AZURE_API_KEY", "")
-        name = os.getenv("AZURE_AGENT_NAME", "dev-ktech-demo")
-        if ep and key:
-            try:
-                client = _build_client(ep, key)
-                st.session_state.update({"_client": client, "_agent_name": name})
-                agent = name
-            except Exception:
-                return None, None
+#     if client is None:
+#         ep   = os.getenv("AZURE_AI_ENDPOINT", "")
+#         key  = os.getenv("AZURE_API_KEY", "")
+#         name = os.getenv("AZURE_AGENT_NAME", "dev-ktech-demo")
+#         st.info(ep and key and name and "Attempting to connect to Azure AI Foundry project…")
+#         if ep and key:
+#             try:
+#                 client = _build_client(ep, key)
+#                 st.session_state.update({"_client": client, "_agent_name": name})
+#                 agent = name
+#             except Exception:
+#                 return None, None
 
-    return client, agent
+#     return client, agent
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
