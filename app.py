@@ -3,7 +3,6 @@ Waltonen Quote Estimator Demo
 Built by KitelyTech — Azure AI Foundry Responses API + Streamlit
 """
 import base64
-import glob
 import os
 import re
 import warnings
@@ -92,28 +91,63 @@ for _k, _v in {
 }.items():
     st.session_state.setdefault(_k, _v)
 
-# ── Project files index ────────────────────────────────────────────────────────
-_APP_DIR = Path(__file__).parent
+# ── Azure Blob Storage — project PDF files ─────────────────────────────────────
+def _build_container_client():
+    """Return a ContainerClient if storage env vars are set, else None."""
+    try:
+        from azure.storage.blob import BlobServiceClient
+        conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+        container = os.getenv("AZURE_STORAGE_CONTAINER_NAME", "project-files")
+        if not conn_str or conn_str.startswith("DefaultEndpointsProtocol=https;AccountName=..."):
+            return None, None
+        svc = BlobServiceClient.from_connection_string(conn_str)
+        return svc.get_container_client(container), container
+    except Exception:
+        return None, None
 
-def _index_project_files() -> dict[str, Path]:
-    """Scan for PDFs and map each RJ### code found in the filename to its path."""
-    index: dict[str, Path] = {}
-    for pdf in _APP_DIR.glob("**/*.pdf"):
-        for code in re.findall(r"RJ\d{3,4}", pdf.name, re.IGNORECASE):
-            index[code.upper()] = pdf
+
+def _index_blobs(container_client) -> dict[str, str]:
+    """List all blobs and map each RJ### code in the blob name → blob name."""
+    index: dict[str, str] = {}
+    if container_client is None:
+        return index
+    try:
+        for blob in container_client.list_blobs():
+            filename = Path(blob.name).name
+            for code in re.findall(r"RJ\d{3,4}", filename, re.IGNORECASE):
+                index[code.upper()] = blob.name
+    except Exception:
+        pass
     return index
 
-_PDF_INDEX = _index_project_files()   # built once at startup
+
+_CONTAINER_CLIENT, _CONTAINER_NAME = _build_container_client()
+_PDF_INDEX: dict[str, str] = _index_blobs(_CONTAINER_CLIENT)  # code → blob name
 
 
 def _find_related_files(refs: list[str]) -> list[dict]:
-    """Return [{code, path, name}] for refs that have a matching local PDF."""
+    """Return [{code, blob_name, name}] for refs that have a matching blob."""
     results = []
     for ref in refs:
-        path = _PDF_INDEX.get(ref.upper())
-        if path:
-            results.append({"code": ref.upper(), "path": path, "name": path.name})
+        blob_name = _PDF_INDEX.get(ref.upper())
+        if blob_name:
+            results.append({
+                "code": ref.upper(),
+                "blob_name": blob_name,
+                "name": Path(blob_name).name,
+            })
     return results
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _download_blob(blob_name: str) -> bytes | None:
+    """Download a blob and return its bytes (cached 5 min)."""
+    if _CONTAINER_CLIENT is None:
+        return None
+    try:
+        return _CONTAINER_CLIENT.get_blob_client(blob_name).download_blob().readall()
+    except Exception:
+        return None
 
 
 # ── Client factory ─────────────────────────────────────────────────────────────
@@ -216,9 +250,6 @@ def _render_project_files(refs: list[str], key_pfx: str):
 
     with st.expander(f"📁  Related Project Files  ({len(files)} available)", expanded=False):
         for item in files:
-            pdf_bytes = item["path"].read_bytes()
-            b64 = base64.b64encode(pdf_bytes).decode()
-
             # ── file row ──────────────────────────────────────────────────────
             c_info, c_dl, c_prev = st.columns([5, 1, 1])
             with c_info:
@@ -232,14 +263,19 @@ def _render_project_files(refs: list[str], key_pfx: str):
                     unsafe_allow_html=True,
                 )
             with c_dl:
-                st.download_button(
-                    "⬇️ Download",
-                    data=pdf_bytes,
-                    file_name=item["name"],
-                    mime="application/pdf",
-                    key=f"dl_{key_pfx}_{item['code']}",
-                    use_container_width=True,
-                )
+                pdf_bytes = _download_blob(item["blob_name"])
+                if pdf_bytes:
+                    st.download_button(
+                        "⬇️ Download",
+                        data=pdf_bytes,
+                        file_name=item["name"],
+                        mime="application/pdf",
+                        key=f"dl_{key_pfx}_{item['code']}",
+                        use_container_width=True,
+                    )
+                else:
+                    st.button("⬇️ N/A", key=f"dl_{key_pfx}_{item['code']}",
+                              disabled=True, use_container_width=True)
             with c_prev:
                 toggle_key = f"show_{key_pfx}_{item['code']}"
                 if toggle_key not in st.session_state:
@@ -251,13 +287,18 @@ def _render_project_files(refs: list[str], key_pfx: str):
 
             # ── inline PDF preview ────────────────────────────────────────────
             if st.session_state.get(toggle_key, False):
-                st.markdown(
-                    f'<iframe src="data:application/pdf;base64,{b64}" '
-                    f'width="100%" height="680" '
-                    f'style="border:1px solid #30363d;border-radius:8px;'
-                    f'margin:8px 0 16px"></iframe>',
-                    unsafe_allow_html=True,
-                )
+                preview_bytes = _download_blob(item["blob_name"])
+                if preview_bytes:
+                    b64 = base64.b64encode(preview_bytes).decode()
+                    st.markdown(
+                        f'<iframe src="data:application/pdf;base64,{b64}" '
+                        f'width="100%" height="680" '
+                        f'style="border:1px solid #30363d;border-radius:8px;'
+                        f'margin:8px 0 16px"></iframe>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.warning("Could not load PDF from Azure Blob Storage.")
 
 
 def _render_card(p: dict, key_pfx: str = "0"):
