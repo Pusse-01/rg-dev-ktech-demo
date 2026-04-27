@@ -1,7 +1,3 @@
-"""
-Waltonen Quote Estimator Demo
-Built by KitelyTech — Azure AI Foundry Responses API + Streamlit
-"""
 import base64
 import os
 import re
@@ -139,8 +135,8 @@ def _index_local_files() -> dict[str, Path]:
 
 
 _CONTAINER_CLIENT, _CONTAINER_NAME = _build_container_client()
-_BLOB_INDEX: dict[str, str] = _index_blobs(_CONTAINER_CLIENT)   # code → blob name
-_LOCAL_INDEX: dict[str, Path] = _index_local_files()            # code → local path (fallback)
+_BLOB_INDEX: dict[str, str] = _index_blobs(_CONTAINER_CLIENT)
+_LOCAL_INDEX: dict[str, Path] = _index_local_files() 
 
 
 def _find_related_files(refs: list[str]) -> list[dict]:
@@ -183,20 +179,13 @@ def _get_pdf_bytes(item: dict) -> bytes | None:
         return None
 
 # ── Client factory ─────────────────────────────────────────────────────────────
-def _build_client(endpoint: str, api_key: str):
-    """
-    Uses the API Key from your .env. Removed .project_name to fix the AttributeError.
-    """
-    # Use the API key explicitly
+def _build_client(endpoint: str):
     credential = DefaultAzureCredential()
 
     project_client = AIProjectClient(
         endpoint=endpoint,
         credential=credential,
     )
-    
-    # We'll show a generic success message since .project_name isn't available
-    # st.success("✅ Successfully connected to Azure AI Foundry")
     return project_client.get_openai_client()
 
 
@@ -212,7 +201,7 @@ def _ensure_ready():
         
         if ep and key and name:
             try:
-                client = _build_client(ep, key)
+                client = _build_client(ep)
                 st.session_state.update({"_client": client, "_agent_name": name})
                 agent = name
             except Exception as e:
@@ -283,37 +272,6 @@ def _run_query(client, agent_name, user_text, prev_id):
     text = getattr(response, "output_text", "") or ""
     return text.strip() or "No response received.", r_id
 
-# ── Response parsing ───────────────────────────────────────────────────────────
-# def _parse(text: str) -> dict:
-#     refs = sorted(set(re.findall(r"\bRJ\d{3,4}\b", text, re.IGNORECASE)))
-
-#     def timeline():
-#         m = re.search(r"\*{0,2}timeline\*{0,2}\**\s*[:\-]\s*([^\n]{5,120})", text, re.IGNORECASE)
-#         return m.group(1).strip("* \t") if m else None
-
-#     def cost(*labels):
-#         for lbl in labels:
-#             for pat in [
-#                 rf"\*{{0,2}}{re.escape(lbl)}\*{{0,2}}\**\s*[:\-]\s*(?:USD\s*)?\$?([\d,]+(?:\.\d{{1,2}})?)",
-#                 rf"\*{{0,2}}{re.escape(lbl)}\*{{0,2}}\**\s*[:\-]\s*([\d,]+(?:\.\d{{1,2}})?)\s*USD",
-#             ]:
-#                 m = re.search(pat, text, re.IGNORECASE)
-#                 if m:
-#                     return float(m.group(1).replace(",", ""))
-#         return None
-
-#     mat = cost("material cost", "material costs", "materials cost", "materials")
-#     lab = cost("labor cost", "labour cost", "labor", "labour", "installation cost", "fabrication cost")
-#     tot = cost("total estimate", "total cost", "grand total", "total")
-#     if tot is None and mat and lab:
-#         tot = mat + lab
-
-#     tl = timeline()
-#     return {
-#         "has_estimate": bool(refs or tl or mat or lab or tot),
-#         "timeline": tl, "material_cost": mat, "labor_cost": lab,
-#         "total_cost": tot, "references": refs,
-#     }
 def _parse(text: str) -> dict:
     # st.write(f"🔍 {text}")
     refs = sorted(set(re.findall(r"\bRJ\d{3,4}\b", text, re.IGNORECASE)))
@@ -369,63 +327,6 @@ def _parse(text: str) -> dict:
 # ── Rendering ──────────────────────────────────────────────────────────────────
 def _usd(v):
     return f"USD {v:,.0f}" if v is not None else "—"
-
-
-# def _render_project_files(refs: list[str], key_pfx: str):
-#     """Expandable section showing downloadable + previewable PDFs for each ref."""
-#     files = _find_related_files(refs)
-#     if not files:
-#         return
-
-#     with st.expander(f"📁  Related Project Files  ({len(files)} available)", expanded=True):
-#         for item in files:
-#             # ── file row ──────────────────────────────────────────────────────
-#             c_info, c_dl, c_prev = st.columns([5, 1, 1])
-#             with c_info:
-#                 src_label = "Azure" if item["source"] == "blob" else "Local"
-#                 st.markdown(
-#                     f'<div class="proj-file-row">'
-#                     f'<span class="proj-file-icon">📄</span>'
-#                     f'<div>'
-#                     f'<div class="proj-file-name">{item["name"]}</div>'
-#                     f'<div class="proj-file-code">{item["code"]} · {src_label}</div>'
-#                     f'</div></div>',
-#                     unsafe_allow_html=True,
-#                 )
-#             with c_dl:
-#                 pdf_bytes = _get_pdf_bytes(item)
-#                 if pdf_bytes:
-#                     st.download_button(
-#                         "⬇️ Download",
-#                         data=pdf_bytes,
-#                         file_name=item["name"],
-#                         mime="application/pdf",
-#                         key=f"dl_{key_pfx}_{item['code']}",
-#                         use_container_width=True,
-#                     )
-#             with c_prev:
-#                 toggle_key = f"show_{key_pfx}_{item['code']}"
-#                 if toggle_key not in st.session_state:
-#                     st.session_state[toggle_key] = False
-#                 label = "🙈 Hide" if st.session_state[toggle_key] else "👁️ Preview"
-#                 if st.button(label, key=f"btn_{key_pfx}_{item['code']}", use_container_width=True):
-#                     st.session_state[toggle_key] = not st.session_state[toggle_key]
-#                     st.rerun()
-
-#             # ── inline PDF preview ────────────────────────────────────────────
-#             if st.session_state.get(toggle_key, False):
-#                 preview_bytes = _get_pdf_bytes(item)
-#                 if preview_bytes:
-#                     b64 = base64.b64encode(preview_bytes).decode()
-#                     st.markdown(
-#                         f'<iframe src="data:application/pdf;base64,{b64}" '
-#                         f'width="100%" height="680" '
-#                         f'style="border:1px solid #30363d;border-radius:8px;'
-#                         f'margin:8px 0 16px"></iframe>',
-#                         unsafe_allow_html=True,
-#                     )
-#                 else:
-#                     st.warning("PDF could not be loaded.")
 
 def _render_project_files(refs, key_pfx):
     files = _find_related_files(refs)
@@ -503,28 +404,6 @@ def _render_card(p: dict, key_pfx: str = "0"):
         _render_project_files(p["references"], key_pfx=key_pfx)
 
     st.divider()
-
-
-# # ── Auto-connect from env ──────────────────────────────────────────────────────
-# def _ensure_ready():
-#     client = st.session_state["_client"]
-#     agent  = st.session_state["_agent_name"]
-
-#     if client is None:
-#         ep   = os.getenv("AZURE_AI_ENDPOINT", "")
-#         key  = os.getenv("AZURE_API_KEY", "")
-#         name = os.getenv("AZURE_AGENT_NAME", "dev-ktech-demo")
-#         st.info(ep and key and name and "Attempting to connect to Azure AI Foundry project…")
-#         if ep and key:
-#             try:
-#                 client = _build_client(ep, key)
-#                 st.session_state.update({"_client": client, "_agent_name": name})
-#                 agent = name
-#             except Exception:
-#                 return None, None
-
-#     return client, agent
-
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
