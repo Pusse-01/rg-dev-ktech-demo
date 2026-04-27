@@ -659,26 +659,20 @@ with st.sidebar:
     st.divider()
     st.markdown("**💡 Try these queries:**")
     _EXAMPLES = [
-        # Targets RJ979 (Lake Garden Wardrobe)
-        "Quote a built-in MDF wardrobe with PU spray paint and internal LED rods.",
-        
-        # Targets RJ908 (Charcoal Restaurant)
-        "Cost for a black powder-coated aluminum restaurant sign and 4 brushed brass lift button signs.",
-        
-        # Targets RJ985 (Luxury Teak Dining Set)
-        "Estimate for an 8-seater solid teak dining table with upholstered chairs and a ribbed credenza.",
-        
-        # Targets RJ972 (The Archives Buckets)
-        "Manufacturing timeline and cost for 10 oxidized brass buckets with GI rod stands.",
-        
-        # Targets RJ969 (ITC Mirrors)
-        "Quote for 5 LED backlit vanity mirrors and 2 frameless full-length dressing mirrors.",
-        
-        # Targets RJ973 (Bedheads Rework - *New addition based on your PDFs*)
-        "Cost to rework and reupholster a bedhead feature wall with velvet fabric and button tufting.",
-        
-        # Targets RJ979 + RJ985 (The "What-if" scenario)
-        "Estimate a custom built-in wardrobe, but instead of MDF, price it using solid local teak wood based on past projects."
+        # 1. Hospitality — reception desk fit-out
+        "Quote a curved reception desk in walnut veneer with a backlit logo wall and stone countertop for a boutique hotel lobby.",
+
+        # 2. Retail — display fixtures (volume order)
+        "Cost and timeline to fabricate 12 freestanding retail display units in powder-coated steel with oak shelving and integrated spotlights.",
+
+        # 3. Office — partition + glass system
+        "Estimate for a 25-meter run of double-glazed office partitions with aluminum framing, 3 pivot doors, and frosted privacy bands.",
+
+        # 4. Residential — kitchen island
+        "Quote a 3.6m kitchen island with quartz countertop, fluted oak base cabinets, brushed brass handles, and integrated waste sorter.",
+
+        # 5. Commercial — exterior signage package
+        "Cost for a complete office-tower signage package: one 4m illuminated facade sign, 6 directional pylons, and acrylic suite numbers for 40 units.",
     ]
     for _ex in _EXAMPLES:
         if st.button(_ex, key=f"ex_{hash(_ex)}", use_container_width=True):
