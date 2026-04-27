@@ -659,21 +659,11 @@ with st.sidebar:
     st.divider()
     st.markdown("**💡 Try these queries:**")
     _EXAMPLES = [
-        # 1. Hospitality — reception desk fit-out
-        "Quote a curved reception desk in walnut veneer with a backlit logo wall and stone countertop for a boutique hotel lobby.",
-
-        # 2. Retail — display fixtures (volume order)
-        "Cost and timeline to fabricate 12 freestanding retail display units in powder-coated steel with oak shelving and integrated spotlights.",
-
-        # 3. Office — partition + glass system
-        "Estimate for a 25-meter run of double-glazed office partitions with aluminum framing, 3 pivot doors, and frosted privacy bands.",
-
-        # 4. Residential — kitchen island
-        "Quote a 3.6m kitchen island with quartz countertop, fluted oak base cabinets, brushed brass handles, and integrated waste sorter.",
-
-        # 5. Commercial — exterior signage package
-        "Cost for a complete office-tower signage package: one 4m illuminated facade sign, 6 directional pylons, and acrylic suite numbers for 40 units.",
-    ]
+    "We need a quote for a weld fixture for our body shop line. Running 3 shifts, roughly 200k units/year. We have 3 part variants and need changeover under 90 seconds. FANUC robots already on the line. Need simulation done in Process Simulate and full PPAP support. Tolerance at datums is ±0.5mm.",
+    "Looking for a supplier to machine 300 aluminum brackets in 7075-T6. Need 5-axis capability, tolerances around ±0.003 inch, surface finish 125 µin. CMM reports required per part. Parts need anodizing and we're AS9100. Can you split delivery into 2 lots?",
+    "We're working on a ground vehicle program and need a simulation model of our hydraulic steering subsystem. Has to run real-time and integrate into our Simulink environment. On-prem only due to ITAR. Need systems engineering docs and validation against test data.",
+    "We have an old transmission housing — no drawings, no CAD. Need someone to scan it, build a full parametric model with GD&T, and then look at redesigning it to cut weight by around 8–10%. We'd also want a machined prototype at the end for testing.",
+    "Need a turnkey assembly cell. Cycle time target is around 50 seconds. Two robots, vision for part pick, Allen-Bradley controls. End of line needs torque check and a camera inspection. We'll need FAT at your facility and SAT at ours, plus operator training."]
     for _ex in _EXAMPLES:
         if st.button(_ex, key=f"ex_{hash(_ex)}", use_container_width=True):
             st.session_state["_pending"] = _ex
