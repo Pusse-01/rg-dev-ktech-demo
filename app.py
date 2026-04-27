@@ -1,18 +1,15 @@
-"""
-Waltonen Quote Estimator Demo
-Built by KitelyTech — Azure AI Foundry Responses API + Streamlit
-"""
 import base64
 import os
 import re
 import warnings
 from pathlib import Path
-
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.projects import AIProjectClient
+from azure.identity import DefaultAzureCredential
 import streamlit as st
 from dotenv import load_dotenv
 
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 load_dotenv()
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -32,30 +29,34 @@ st.markdown("""<style>
 
 .metric-card {
     background:#161b22; border:1px solid #21262d; border-radius:10px;
-    padding:14px 16px; text-align:center; height:100px;
+    padding:14px 16px; text-align:center;
+    min-height:100px;
     display:flex; flex-direction:column; justify-content:center;
     transition:border-color .2s;
+    word-wrap:break-word;
+    overflow-wrap:break-word;
 }
 .metric-card:hover { border-color:#388bfd; }
 .metric-label { color:#8b949e; font-size:.68rem; text-transform:uppercase; letter-spacing:1.2px; margin-bottom:6px; }
-.metric-value { color:#e6edf3; font-size:1.05rem; font-weight:700; }
+.metric-value {
+    color:#e6edf3; font-size:1.05rem; font-weight:700;
+    line-height:1.4;
+    word-wrap:break-word;
+    overflow-wrap:break-word;
+    white-space:normal;
+}
 .metric-value.lg { font-size:1.3rem; }
 
 .total-banner {
     background:linear-gradient(90deg,#1f6feb,#388bfd); border-radius:10px;
-    padding:14px 20px; text-align:center; margin-top:10px;
+    padding:14px 20px; text-align:center;
+    margin-top:16px; margin-bottom:8px;
 }
 .total-banner .lbl { color:#cae8ff; font-size:.7rem; letter-spacing:2px; text-transform:uppercase; }
 .total-banner .amt { color:#fff; font-size:2rem; font-weight:800; margin-top:2px; }
 
-.ref-section { margin-top:12px; }
-.ref-label { color:#8b949e; font-size:.68rem; letter-spacing:1.2px; text-transform:uppercase; }
-.ref-badge {
-    display:inline-block; background:#0f2a1a; color:#56d364;
-    border:1px solid #238636; border-radius:6px;
-    padding:3px 10px; font-size:.78rem; font-weight:600;
-    margin:4px 3px 0; font-family:monospace;
-}
+.ref-section { margin-top:20px; margin-bottom:12px; }
+.ref-label { color:#8b949e; font-size:.68rem; letter-spacing:1.2px; text-transform:uppercase; margin-bottom:8px; }
 
 .est-header {
     color:#58a6ff; font-size:.8rem; font-weight:600;
@@ -134,8 +135,8 @@ def _index_local_files() -> dict[str, Path]:
 
 
 _CONTAINER_CLIENT, _CONTAINER_NAME = _build_container_client()
-_BLOB_INDEX: dict[str, str] = _index_blobs(_CONTAINER_CLIENT)   # code → blob name
-_LOCAL_INDEX: dict[str, Path] = _index_local_files()            # code → local path (fallback)
+_BLOB_INDEX: dict[str, str] = _index_blobs(_CONTAINER_CLIENT)
+_LOCAL_INDEX: dict[str, Path] = _index_local_files() 
 
 
 def _find_related_files(refs: list[str]) -> list[dict]:
@@ -177,79 +178,137 @@ def _get_pdf_bytes(item: dict) -> bytes | None:
     except Exception:
         return None
 
-
 # ── Client factory ─────────────────────────────────────────────────────────────
-def _build_client(endpoint: str, api_key: str):
-    """Plain OpenAI client with /v1/ baked into base_url (no ?api-version param)."""
-    from openai import OpenAI
+def _build_client(endpoint: str):
+    credential = DefaultAzureCredential()
 
-    ep = endpoint.rstrip("/")
+    project_client = AIProjectClient(
+        endpoint=endpoint,
+        credential=credential,
+    )
+    return project_client.get_openai_client()
 
-    if ep.endswith("/responses"):
-        base_url = ep[: -len("responses")]
-    elif ep.endswith("/v1"):
-        base_url = ep + "/"
-    elif "/openai/v1" in ep:
-        base_url = ep[: ep.index("/openai/v1") + len("/openai/v1")] + "/"
-    else:
-        if "services.ai.azure.com" in ep and "/api/projects/" not in ep:
-            ep += "/api/projects/_project"
-        base_url = ep + "/openai/v1/"
 
-    return OpenAI(api_key=api_key, base_url=base_url, default_query={"api-version": "2025-11-15-preview"})
+# ── Auto-connect from env ──────────────────────────────────────────────────────
+def _ensure_ready():
+    client = st.session_state["_client"]
+    agent  = st.session_state["_agent_name"]
 
+    if client is None:
+        ep   = os.getenv("AZURE_AI_ENDPOINT", "")
+        key  = os.getenv("AZURE_API_KEY", "")
+        name = os.getenv("AZURE_AGENT_NAME", "dev-ktech-demo")
+        
+        if ep and key and name:
+            try:
+                client = _build_client(ep)
+                st.session_state.update({"_client": client, "_agent_name": name})
+                agent = name
+            except Exception as e:
+                # This catches real connection issues (like a bad API key)
+                st.error(f"❌ Connection failed: {e}")
+                return None, None
+        else:
+            return None, None
+
+    return client, agent
 
 # ── Formatting guide ───────────────────────────────────────────────────────────
 _GUIDE = (
     "\n\n---\n"
     "RESPONSE FORMAT — always use these exact section headers for estimates:\n\n"
     "- **Timeline**: [X weeks with brief phase breakdown]\n"
-    "- **Material Cost**: USD [amount]  *(raw materials & finishes)*\n"
-    "- **Labor Cost**: USD [amount]  *(fabrication & installation)*\n"
-    "- **Total Estimate**: USD [amount]\n"
+    "- **Material Cost**: [amount] USD  *(raw materials & finishes)*\n"
+    "- **Labor Cost**: [amount] USD  *(fabrication & installation)*\n"
+    "- **Total Estimate**: [amount] USD\n"
     "- **Reference Projects**: [list project codes from the knowledge base, e.g. RJ979, RJ908]\n\n"
     "If original data shows one combined cost, split it using typical industry ratios.\n"
     "---"
 )
 
 
-def _run_query(client, agent_name: str, user_text: str, prev_id: str | None) -> tuple[str, str]:
-    kwargs: dict = dict(
-        model=agent_name,
+def _run_query(client, agent_name, user_text, prev_id):
+    kwargs = dict(
         input=[{"role": "user", "content": user_text + _GUIDE}],
+        extra_body={"agent_reference": {"name": agent_name, "version": "15", "type": "agent_reference"}},
     )
     if prev_id:
         kwargs["previous_response_id"] = prev_id
 
     response = client.responses.create(**kwargs)
 
-    text: str = getattr(response, "output_text", "") or ""
-    if not text:
-        for item in getattr(response, "output", []):
-            for c in getattr(item, "content", []):
-                text += getattr(c, "text", "")
+    # Loop: auto-approve any MCP approval requests until the run truly completes
+    max_iterations = 5
+    while max_iterations > 0:
+        approval_requests = [
+            item for item in getattr(response, "output", [])
+            if getattr(item, "type", "") == "mcp_approval_request"
+        ]
+        if not approval_requests:
+            break
 
-    return text.strip() or "No response received.", response.id
+        approval_inputs = [
+            {
+                "type": "mcp_approval_response",
+                "approval_request_id": req.id,
+                "approve": True,
+            }
+            for req in approval_requests
+        ]
 
+        response = client.responses.create(
+            input=approval_inputs,
+            previous_response_id=response.id,
+            extra_body={"agent_reference": {"name": agent_name, "version": "9", "type": "agent_reference"}},
+        )
+        max_iterations -= 1
 
-# ── Response parsing ───────────────────────────────────────────────────────────
+    # Now extract output_text normally
+    r_id = getattr(response, "id", "unknown")
+    usage = getattr(response, "usage", None)
+    tokens = getattr(usage, "total_tokens", "N/A") if usage else "N/A"
+    st.write(f"⏳ Response ID: {r_id} · Tokens used: {tokens}")
+
+    text = getattr(response, "output_text", "") or ""
+    return text.strip() or "No response received.", r_id
+
 def _parse(text: str) -> dict:
+    # st.write(f"🔍 {text}")
     refs = sorted(set(re.findall(r"\bRJ\d{3,4}\b", text, re.IGNORECASE)))
 
     def timeline():
-        m = re.search(r"\*{0,2}timeline\*{0,2}\**\s*[:\-]\s*([^\n]{5,120})", text, re.IGNORECASE)
-        return m.group(1).strip("* \t") if m else None
+        # First grab everything after the Timeline label up to the next section
+        m = re.search(
+            r"\*{0,2}timeline\*{0,2}\**\s*[:\-]\s*(.+?)(?=\n(?:\s*[-*•]?\s*\*{0,2}(?:material|labor|total|reference))|$)",
+            text, re.IGNORECASE | re.DOTALL,
+        )
+        if not m:
+            return None
+        raw = m.group(1).strip("* \t\n")
+
+        # Extract just the duration headline (e.g. "4 weeks", "6-8 weeks", "10 days")
+        dur = re.search(
+            r"(\d+(?:\s*[-–]\s*\d+)?\s*(?:week|day|month)s?)",
+            raw, re.IGNORECASE,
+        )
+        if dur:
+            return dur.group(1).strip()
+
+        # Fallback: first line only, truncated if very long
+        first_line = raw.split("\n")[0].split(" - ")[0].strip()
+        return (first_line[:50] + "…") if len(first_line) > 50 else first_line
 
     def cost(*labels):
         for lbl in labels:
             for pat in [
                 rf"\*{{0,2}}{re.escape(lbl)}\*{{0,2}}\**\s*[:\-]\s*(?:USD\s*)?\$?([\d,]+(?:\.\d{{1,2}})?)",
+                rf"\*{{0,2}}{re.escape(lbl)}\*{{0,2}}\**\s*[:\-]\s*(?:USD\s*)?([\d,]+(?:\.\d{{1,2}})?)",
                 rf"\*{{0,2}}{re.escape(lbl)}\*{{0,2}}\**\s*[:\-]\s*([\d,]+(?:\.\d{{1,2}})?)\s*USD",
             ]:
                 m = re.search(pat, text, re.IGNORECASE)
                 if m:
                     return float(m.group(1).replace(",", ""))
-        return None
+        return None 
 
     mat = cost("material cost", "material costs", "materials cost", "materials")
     lab = cost("labor cost", "labour cost", "labor", "labour", "installation cost", "fabrication cost")
@@ -269,53 +328,36 @@ def _parse(text: str) -> dict:
 def _usd(v):
     return f"USD {v:,.0f}" if v is not None else "—"
 
-
-def _render_project_files(refs: list[str], key_pfx: str):
-    """Expandable section showing downloadable + previewable PDFs for each ref."""
+def _render_project_files(refs, key_pfx):
     files = _find_related_files(refs)
     if not files:
         return
-
-    with st.expander(f"📁  Related Project Files  ({len(files)} available)", expanded=True):
+    with st.expander(f"📁  Related Project Files  ({len(files)})", expanded=True):
         for item in files:
-            # ── file row ──────────────────────────────────────────────────────
+            t_key = f"sh_{key_pfx}_{item['code']}"
             c_info, c_dl, c_prev = st.columns([5, 1, 1])
             with c_info:
-                src_label = "Azure" if item["source"] == "blob" else "Local"
                 st.markdown(
-                    f'<div class="proj-file-row">'
-                    f'<span class="proj-file-icon">📄</span>'
-                    f'<div>'
-                    f'<div class="proj-file-name">{item["name"]}</div>'
-                    f'<div class="proj-file-code">{item["code"]} · {src_label}</div>'
-                    f'</div></div>',
+                    f'<div class="proj-file-row"><span class="proj-file-icon">📄</span>'
+                    f'<div><div class="proj-file-name">{item["name"]}</div>'
+                    f'<div class="proj-file-code">{item["code"]}</div></div></div>',
                     unsafe_allow_html=True,
                 )
             with c_dl:
-                pdf_bytes = _get_pdf_bytes(item)
-                if pdf_bytes:
+                b = _get_pdf_bytes(item)
+                if b:
                     st.download_button(
-                        "⬇️ Download",
-                        data=pdf_bytes,
-                        file_name=item["name"],
-                        mime="application/pdf",
+                        "⬇️", b, item["name"], "application/pdf",
                         key=f"dl_{key_pfx}_{item['code']}",
-                        use_container_width=True,
                     )
             with c_prev:
-                toggle_key = f"show_{key_pfx}_{item['code']}"
-                if toggle_key not in st.session_state:
-                    st.session_state[toggle_key] = False
-                label = "🙈 Hide" if st.session_state[toggle_key] else "👁️ Preview"
-                if st.button(label, key=f"btn_{key_pfx}_{item['code']}", use_container_width=True):
-                    st.session_state[toggle_key] = not st.session_state[toggle_key]
+                if st.button("👁️", key=f"bt_{key_pfx}_{item['code']}"):
+                    st.session_state[t_key] = not st.session_state.get(t_key, False)
                     st.rerun()
-
-            # ── inline PDF preview ────────────────────────────────────────────
-            if st.session_state.get(toggle_key, False):
-                preview_bytes = _get_pdf_bytes(item)
-                if preview_bytes:
-                    b64 = base64.b64encode(preview_bytes).decode()
+            if st.session_state.get(t_key, False):
+                b = _get_pdf_bytes(item)
+                if b:
+                    b64 = base64.b64encode(b).decode()
                     st.markdown(
                         f'<iframe src="data:application/pdf;base64,{b64}" '
                         f'width="100%" height="680" '
@@ -325,8 +367,7 @@ def _render_project_files(refs: list[str], key_pfx: str):
                     )
                 else:
                     st.warning("PDF could not be loaded.")
-
-
+                    
 def _render_card(p: dict, key_pfx: str = "0"):
     st.markdown('<div class="est-header">📋 Estimate Summary</div>', unsafe_allow_html=True)
 
@@ -363,27 +404,6 @@ def _render_card(p: dict, key_pfx: str = "0"):
         _render_project_files(p["references"], key_pfx=key_pfx)
 
     st.divider()
-
-
-# ── Auto-connect from env ──────────────────────────────────────────────────────
-def _ensure_ready():
-    client = st.session_state["_client"]
-    agent  = st.session_state["_agent_name"]
-
-    if client is None:
-        ep   = os.getenv("AZURE_AI_ENDPOINT", "")
-        key  = os.getenv("AZURE_API_KEY", "")
-        name = os.getenv("AZURE_AGENT_NAME", "dev-ktech-demo")
-        if ep and key:
-            try:
-                client = _build_client(ep, key)
-                st.session_state.update({"_client": client, "_agent_name": name})
-                agent = name
-            except Exception:
-                return None, None
-
-    return client, agent
-
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
