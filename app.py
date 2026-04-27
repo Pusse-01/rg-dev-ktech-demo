@@ -343,7 +343,7 @@ def _build_container_client():
     try:
         from azure.storage.blob import BlobServiceClient
         conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
-        container = os.getenv("AZURE_STORAGE_CONTAINER_NAME", "project-files")
+        container = os.getenv("AZURE_STORAGE_CONTAINER_NAME", "project-data")
         if not conn_str or conn_str.startswith("DefaultEndpointsProtocol=https;AccountName=..."):
             return None, None
         svc = BlobServiceClient.from_connection_string(conn_str)
@@ -568,7 +568,7 @@ def _parse(text: str) -> dict:
 
 # ── Rendering ──────────────────────────────────────────────────────────────────
 def _usd(v):
-    return f"USD {v:,.0f}" if v is not None else "—"
+    return f"$ {v:,.0f}" if v is not None else "—"
 
 def _render_project_files(refs, key_pfx):
     files = _find_related_files(refs)
