@@ -33,30 +33,34 @@ st.markdown("""<style>
 
 .metric-card {
     background:#161b22; border:1px solid #21262d; border-radius:10px;
-    padding:14px 16px; text-align:center; height:100px;
+    padding:14px 16px; text-align:center;
+    min-height:100px;
     display:flex; flex-direction:column; justify-content:center;
     transition:border-color .2s;
+    word-wrap:break-word;
+    overflow-wrap:break-word;
 }
 .metric-card:hover { border-color:#388bfd; }
 .metric-label { color:#8b949e; font-size:.68rem; text-transform:uppercase; letter-spacing:1.2px; margin-bottom:6px; }
-.metric-value { color:#e6edf3; font-size:1.05rem; font-weight:700; }
+.metric-value {
+    color:#e6edf3; font-size:1.05rem; font-weight:700;
+    line-height:1.4;
+    word-wrap:break-word;
+    overflow-wrap:break-word;
+    white-space:normal;
+}
 .metric-value.lg { font-size:1.3rem; }
 
 .total-banner {
     background:linear-gradient(90deg,#1f6feb,#388bfd); border-radius:10px;
-    padding:14px 20px; text-align:center; margin-top:10px;
+    padding:14px 20px; text-align:center;
+    margin-top:16px; margin-bottom:8px;
 }
 .total-banner .lbl { color:#cae8ff; font-size:.7rem; letter-spacing:2px; text-transform:uppercase; }
 .total-banner .amt { color:#fff; font-size:2rem; font-weight:800; margin-top:2px; }
 
-.ref-section { margin-top:12px; }
-.ref-label { color:#8b949e; font-size:.68rem; letter-spacing:1.2px; text-transform:uppercase; }
-.ref-badge {
-    display:inline-block; background:#0f2a1a; color:#56d364;
-    border:1px solid #238636; border-radius:6px;
-    padding:3px 10px; font-size:.78rem; font-weight:600;
-    margin:4px 3px 0; font-family:monospace;
-}
+.ref-section { margin-top:20px; margin-bottom:12px; }
+.ref-label { color:#8b949e; font-size:.68rem; letter-spacing:1.2px; text-transform:uppercase; margin-bottom:8px; }
 
 .est-header {
     color:#58a6ff; font-size:.8rem; font-weight:600;
@@ -234,53 +238,50 @@ _GUIDE = (
 )
 
 
-def _run_query(client, agent_name: str, user_text: str, prev_id: str | None) -> tuple[str, str]:
-    kwargs: dict = dict(
+def _run_query(client, agent_name, user_text, prev_id):
+    kwargs = dict(
         input=[{"role": "user", "content": user_text + _GUIDE}],
-        extra_body={"agent_reference": {"name": agent_name, "version": "9", "type": "agent_reference"}},
+        extra_body={"agent_reference": {"name": agent_name, "version": "15", "type": "agent_reference"}},
     )
     if prev_id:
         kwargs["previous_response_id"] = prev_id
 
     response = client.responses.create(**kwargs)
-    # st.write(f"⏳ Response ID: {response} · Tokens used: {getattr(response, 'tokens_used', 'N/A')}")
 
-    # Safely extract usage and response info
-    r_id = getattr(response, "id", getattr(response, "response_id", "unknown"))
+    # Loop: auto-approve any MCP approval requests until the run truly completes
+    max_iterations = 5
+    while max_iterations > 0:
+        approval_requests = [
+            item for item in getattr(response, "output", [])
+            if getattr(item, "type", "") == "mcp_approval_request"
+        ]
+        if not approval_requests:
+            break
+
+        approval_inputs = [
+            {
+                "type": "mcp_approval_response",
+                "approval_request_id": req.id,
+                "approve": True,
+            }
+            for req in approval_requests
+        ]
+
+        response = client.responses.create(
+            input=approval_inputs,
+            previous_response_id=response.id,
+            extra_body={"agent_reference": {"name": agent_name, "version": "9", "type": "agent_reference"}},
+        )
+        max_iterations -= 1
+
+    # Now extract output_text normally
+    r_id = getattr(response, "id", "unknown")
     usage = getattr(response, "usage", None)
     tokens = getattr(usage, "total_tokens", "N/A") if usage else "N/A"
-    
     st.write(f"⏳ Response ID: {r_id} · Tokens used: {tokens}")
 
-    text: str = getattr(response, "output_text", "") or ""
-    st.write(response)
-    
-    # # UPDATED PARSING LOGIC: Extract data from memories or tools if output_text is empty
-    if not text:
-        for item in getattr(response, "output", []):
-            # 1. Standard text content
-            content = getattr(item, "content", None)
-            if content:
-                if isinstance(content, list):
-                    for c in content:
-                        text += getattr(c, "text", "") + "\n\n"
-                elif isinstance(content, str):
-                    text += content + "\n\n"
-            
-            # 2. Memory Search calls (Handles the 'ResponseOutputMessage' log structure)
-            if getattr(item, "type", "") == "memory_search_call":
-                memories = getattr(item, "memories", [])
-                for mem in memories:
-                    if isinstance(mem, dict) and "content" in mem:
-                        text += mem["content"] + "\n\n"
-                        
-            # 3. Tool arguments (Fallback for 'McpApprovalRequest')
-            args = getattr(item, "arguments", "")
-            if isinstance(args, str) and args:
-                text += args + "\n\n"
-
+    text = getattr(response, "output_text", "") or ""
     return text.strip() or "No response received.", r_id
-
 
 # ── Response parsing ───────────────────────────────────────────────────────────
 # def _parse(text: str) -> dict:
@@ -318,8 +319,26 @@ def _parse(text: str) -> dict:
     refs = sorted(set(re.findall(r"\bRJ\d{3,4}\b", text, re.IGNORECASE)))
 
     def timeline():
-        m = re.search(r"\*{0,2}timeline\*{0,2}\**\s*[:\-]\s*(.+?)(?=\n(?:material|labor|total|reference)|$)", text, re.IGNORECASE | re.DOTALL)
-        return m.group(1).strip("* \t\n") if m else None
+        # First grab everything after the Timeline label up to the next section
+        m = re.search(
+            r"\*{0,2}timeline\*{0,2}\**\s*[:\-]\s*(.+?)(?=\n(?:\s*[-*•]?\s*\*{0,2}(?:material|labor|total|reference))|$)",
+            text, re.IGNORECASE | re.DOTALL,
+        )
+        if not m:
+            return None
+        raw = m.group(1).strip("* \t\n")
+
+        # Extract just the duration headline (e.g. "4 weeks", "6-8 weeks", "10 days")
+        dur = re.search(
+            r"(\d+(?:\s*[-–]\s*\d+)?\s*(?:week|day|month)s?)",
+            raw, re.IGNORECASE,
+        )
+        if dur:
+            return dur.group(1).strip()
+
+        # Fallback: first line only, truncated if very long
+        first_line = raw.split("\n")[0].split(" - ")[0].strip()
+        return (first_line[:50] + "…") if len(first_line) > 50 else first_line
 
     def cost(*labels):
         for lbl in labels:
@@ -410,19 +429,27 @@ def _usd(v):
 
 def _render_project_files(refs, key_pfx):
     files = _find_related_files(refs)
-    if not files: return
+    if not files:
+        return
     with st.expander(f"📁  Related Project Files  ({len(files)})", expanded=True):
         for item in files:
+            t_key = f"sh_{key_pfx}_{item['code']}"
             c_info, c_dl, c_prev = st.columns([5, 1, 1])
             with c_info:
-                st.markdown(f'<div class="proj-file-row"><span class="proj-file-icon">📄</span>'
-                            f'<div><div class="proj-file-name">{item["name"]}</div>'
-                            f'<div class="proj-file-code">{item["code"]}</div></div></div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="proj-file-row"><span class="proj-file-icon">📄</span>'
+                    f'<div><div class="proj-file-name">{item["name"]}</div>'
+                    f'<div class="proj-file-code">{item["code"]}</div></div></div>',
+                    unsafe_allow_html=True,
+                )
             with c_dl:
                 b = _get_pdf_bytes(item)
-                if b: st.download_button("⬇️", b, item["name"], "application/pdf", key=f"dl_{key_pfx}_{item['code']}")
+                if b:
+                    st.download_button(
+                        "⬇️", b, item["name"], "application/pdf",
+                        key=f"dl_{key_pfx}_{item['code']}",
+                    )
             with c_prev:
-                t_key = f"sh_{key_pfx}_{item['code']}"
                 if st.button("👁️", key=f"bt_{key_pfx}_{item['code']}"):
                     st.session_state[t_key] = not st.session_state.get(t_key, False)
                     st.rerun()
@@ -430,6 +457,16 @@ def _render_project_files(refs, key_pfx):
                 b = _get_pdf_bytes(item)
                 if b:
                     b64 = base64.b64encode(b).decode()
+                    st.markdown(
+                        f'<iframe src="data:application/pdf;base64,{b64}" '
+                        f'width="100%" height="680" '
+                        f'style="border:1px solid #30363d;border-radius:8px;'
+                        f'margin:8px 0 16px"></iframe>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.warning("PDF could not be loaded.")
+                    
 def _render_card(p: dict, key_pfx: str = "0"):
     st.markdown('<div class="est-header">📋 Estimate Summary</div>', unsafe_allow_html=True)
 
